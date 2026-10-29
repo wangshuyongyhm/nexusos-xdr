@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexusos-xdr"
+version = "1.0.0"
+description = "NEXUS-XDR — Agent 调度总线（dispatch/callback/presence/patrol + MCP :19998）"
+readme = "README.md"
+requires-python = ">=3.10"
+# PEP 621 旧式 text 表（非 SPDX 表达式）——保留 License classifier 不被新版
+# setuptools(≥77, PEP639) 拒绝：license="MIT" 字符串形态会与 classifier 冲突致
+# 干净 venv 安装失败（1609 实测 InvalidConfigError）。
+license = {text = "MIT"}
+authors = [{name = "NEXUS Contributors"}]
+classifiers = ["License :: OSI Approved :: MIT License"]
+# 逐文件实测顶层 import（任务书⚠️批1 pyyaml 教训）：
+# fastmcp(mcp_server) + anyio/starlette(mcp_server/callback/httpapi/presence 直用同栈)
+# + psycopg2(credential/layer2_calibrate/callback顶层, mcp_server懒) + pyyaml(agents/base 懒)。
+# fastmcp 按当前运行版本 minor 锁定（陷阱2：MCP 行为漂移防护）。
+# nexusos-gate 以本地兄弟包满足（三件套同环境/同命令安装；Task668 fail-closed
+# 设计保持硬依赖）。nexusos-mem 降为 extra（Task1597 炸点①：mem 不在 PyPI，
+# 硬依赖让干净环境单装 xdr 直接解析失败；mem 接入点已容错——
+# nexusos_xdr._mem_compat，缺包时用到才报清晰安装指引）。
+dependencies = [
+    "nexusos-gate>=1.0.0",
+    "nexusos-common>=1.0,<2",  # 1957 锚点单源
+    "fastmcp>=3.4.4,<3.5",
+    "anyio>=4.0",
+    "starlette>=1.0",
+    "psycopg2-binary>=2.9",
+    "pyyaml>=5.4",
+]
+
+[project.optional-dependencies]
+# 伴随包可选组：三件套同装用 `pip install ./pypi/nexusos-gate ./pypi/nexusos-mem ./nexusos-xdr`
+# 一条命令同解析（顺序无关）；只想要 xdr+mem 组合用 [mem]。
+mem = ["nexusos-mem"]
+
+# 开源仓库落位（M1 脱敏建仓）后更新为真实主页；切片器不再补注（单一真源）
+[project.urls]
+Homepage = "https://github.com/nexus-family/nexusos-xdr"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# agents 运行面 shell（broadcast_router spawn 的 on_mention 链）
+"nexusos_xdr.agents.zcode" = ["*.sh"]
+"nexusos_xdr.agents.hermes" = ["*.sh"]
+"nexusos_xdr.agents.kimiapp" = ["*.sh"]
+"nexusos_xdr.agents.cursor" = ["*.sh"]
+# 守卫 canonical 源（1963 单5）：hooks 模块 .py 随包分发，部署位 $NEXUS_HOME/xdr/hooks/
+"nexusos_xdr.hooks" = ["*.py"]
+# 配置样例模板（脱敏，随包分发——README 配置样例节引用）
+"nexusos_xdr" = ["config.example.yaml"]
