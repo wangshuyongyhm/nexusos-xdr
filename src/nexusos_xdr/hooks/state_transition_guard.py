@@ -75,21 +75,38 @@ def _has_recent_state_transition_gate(within_seconds: int = 60) -> bool:
     tz8 = timezone(timedelta(hours=8))
     cutoff = datetime.now(tz8) - timedelta(seconds=within_seconds)
 
-    # 261028 紧急修复（zcode3 留痕，工作区态）：G8 日切归档（Task1951）后 legacy
-    # events.jsonl 启动即被迁移改名，guard 恒 False → 全体系 dispatch 被断。
-    # 261028 二次补丁：1960 迁移把归档挪到 ~/.nexus/logs/（第三次"改存储没盘
-    # 消费者"），candidates 双路径兜底。根治=guard import 包内 archive_path_today()
-    # （随包走），已记 P1 单5。
-    arch_env = os.environ.get("NEXUS_XDR_EVENTS_ARCHIVE")
-    today = datetime.now(tz8).strftime("%Y-%m-%d")
+    # task 2010 根治（原 261028 注释预言的"根治=import 包内 archive_path_today()"）：
+    # 读端归档路径必须与写端同源——写端按 UTC 日落文件（session_state
+    # ._today_str()=now_iso()[:10]，UTC），旧读端按本地(UTC+8)日找文件，
+    # 本地 00:00–08:00 窗口 UTC 还在前一日 → 写昨日文件、读今日文件恒 miss
+    # → guard 恒 False → 全体系 dispatch 被拦（261103 凌晨实证，临时 symlink
+    # 桥过渡）。故主路径直接用包内 archive_path_today()，日期语义单源在包内。
     candidates = []
-    if arch_env:
-        candidates.append(os.path.join(os.path.expanduser(arch_env), today + ".jsonl"))
-    candidates += [
-        os.path.expanduser("~/.nexus/logs/xdr-events-archive/" + today + ".jsonl"),
-        os.path.expanduser("~/.hermes/logs/xdr-events-archive/" + today + ".jsonl"),
-        os.path.expanduser("~/.hermes/xdr-sessions/events.jsonl"),
-    ]
+    try:
+        from nexusos_xdr.session_state import archive_path_today, now_iso
+        p_today = archive_path_today()
+        candidates.append(str(p_today))
+        # 跨日切兜底：60s 窗口可横跨 UTC 日切（gate 事件写在 UTC 昨日文件），
+        # 与 session_state.get_events 的 day_now/day_yesterday 双读同语义。
+        day_now = now_iso()[:10]
+        day_yesterday = (datetime.fromisoformat(day_now)
+                         - timedelta(days=1)).strftime("%Y-%m-%d")
+        candidates.append(str(p_today.parent / (day_yesterday + ".jsonl")))
+    except Exception:
+        # 降级（部署副本脱离 pip 包环境、import 不可达时）：沿用旧本地日构造。
+        # 已知缺陷：本地 00:00–08:00 时区错位窗口会读空=fail-closed（宁可误拦
+        # 不可放行），与修复前行为一致；包可达环境永远不会走到这里。
+        arch_env = os.environ.get("NEXUS_XDR_EVENTS_ARCHIVE")
+        today = datetime.now(tz8).strftime("%Y-%m-%d")
+        if arch_env:
+            candidates.append(os.path.join(os.path.expanduser(arch_env),
+                                           today + ".jsonl"))
+        candidates.append(os.path.expanduser(
+            "~/.nexus/logs/xdr-events-archive/" + today + ".jsonl"))
+        candidates.append(os.path.expanduser(
+            "~/.hermes/logs/xdr-events-archive/" + today + ".jsonl"))
+    # legacy 平铺事件文件（G8 日切前形态）——最后兜底，正常已被迁移为空。
+    candidates.append(os.path.expanduser("~/.hermes/xdr-sessions/events.jsonl"))
     events_file = next((p for p in candidates if os.path.exists(p)), None)
     if events_file is None:
         return False

@@ -45,8 +45,11 @@ _ve.setup_sys_path()
 # Task 274 扩展：补 kimi/omp/ac 实际 busy 标志（之前漏导致 patrol 误判 DONE）
 # Task 275 修正：移除 ⏵|⏸（ac.py _WORKING_PATTERN 用 Working|Running|Percolating|Noodling
 #   作为真实工作标志；⏵ 是 ac 状态栏常驻"auto 模式"标志，与 busy 无关，会永久误判 busy）
+# Task 2011 修正：移除 esc interrupt（新版 opencode/AtomCode 空闲页脚常驻该导航串，
+#   常驻标志≠工作标志，致 oc 永久误判 busy、xdr 拒派——Task275 ⏵ 同款判据；
+#   oc 工作态由下方 braille 旋转符覆盖，移除不丢识别）
 _BUSY_PATTERNS = re.compile(
-    r"esc interrupt|Percolating|Noodling|Working"
+    r"Percolating|Noodling|Working"
     # Braille 旋转（oc/opencode 原生）
     r"|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏"
     # kimi 月相（思考中）
