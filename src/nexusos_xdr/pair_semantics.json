@@ -1,0 +1,14 @@
+[
+ {
+  "begin": "hook_invoked",
+  "end": "hook_result",
+  "key": "handler_id",
+  "window_s": 60
+ },
+ {
+  "begin": "init",
+  "end": "cleanup",
+  "key": "agent",
+  "window_s": 604800
+ }
+]
