@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from nexusos_xdr.agents.base import AgentBase
@@ -48,6 +48,19 @@ PATROL_INTERVAL = 30
 # 设计内挂起时无需改码）。默认 48h：覆盖已知全部设计内挂起场景（如 14:00 快照
 # 窗），只拦「反复续期致线程寿命无界」的失控形态。
 SUSPEND_WALL_CAP = int(os.environ.get("NEXUS_SUSPEND_WALL_CAP", str(48 * 3600)))
+# 池 #826①（2611172057）：超时置态前的产出活动证据判定。
+# 动机（1740 形态）：小弟施工在途但长时间无 progress 回调，elapsed 一到预算
+# 即被误标 TIMEOUT。修复：置 TIMEOUT 前扫 task_dir 产出活动（复用 Task303
+# _scan_task_dir_latest_mtime 全目录口径——与四重确认 Check 4 同信号源，
+# 含 process/，input/ 仍跳过）。有活动 = 施工在途 → 只发 WARN 告警不置终态；
+# 连续 N 个巡逻周期无任何活动才置 TIMEOUT——超时兜底仍收敛（僵尸 RUNNING
+# 的最终硬顶仍是 B6 挂起墙顶）。
+# 语义边界（MEM#87640）：timeout 仍是 patrol 线程寿命预算，本判定只改
+# 「预算耗尽 + 二次确认窗口过后」的处置动作，不动预算本身与起算语义。
+TIMEOUT_ACTIVITY_IDLE_CYCLES = int(os.environ.get("NEXUS_TIMEOUT_ACTIVITY_IDLE_CYCLES", "2"))
+# 活动 WARN 告警冷却（同 STUCK 通知 5 分钟冷却惯例）：有活动期间每周期都
+# 判活动，但告警（warning 落账 + 事件流 alert）最多每 300s 一发防刷屏。
+TIMEOUT_ACTIVITY_WARN_COOLDOWN_SEC = 300
 
 
 # === Task609: runtime 注入位（依赖方向 dispatchd → patrol 单向）===
@@ -178,7 +191,8 @@ def parse_cost_from_pane(pane_text: str) -> Optional[float]:
 
 
 def _post_webhook_with_retry(notify_url: str, payload: bytes, attempts: int = 3,
-                              timeout: float = 5, retry_sleep: float = 1.0) -> str:
+                              timeout: float = 5, retry_sleep: float = 1.0,
+                              extra_headers: dict = None) -> str:
     """场景5 webhook POST + 重试（Task596 从 _notify_caller 闭包抽出，行为零变化：
     1 首发 + N-1 重试；非 200 视为失败；成功返回 None，全败返回 last_err 描述。
     抽出目的：notify 重试路径可用故障注入服务器做真实演练（池 #52）。"""
@@ -186,8 +200,12 @@ def _post_webhook_with_retry(notify_url: str, payload: bytes, attempts: int = 3,
     last_err = None
     for attempt in range(attempts):
         try:
+            # 2611231133：自发通知带上该任务的派单凭据（强制模式下也能进）
+            _hdrs = {"Content-Type": "application/json"}
+            if extra_headers:
+                _hdrs.update({str(k): str(v) for k, v in extra_headers.items()})
             req = urllib.request.Request(notify_url, data=payload,
-                                         headers={"Content-Type": "application/json"}, method="POST")
+                                         headers=_hdrs, method="POST")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 200:
                     return None
@@ -200,6 +218,37 @@ def _post_webhook_with_retry(notify_url: str, payload: bytes, attempts: int = 3,
 
 # Task 280 P1-9: 全局 patrol 线程 registry（task_id -> stop_event）
 # 让 cancel_task / shutdown 能统一 stop patrol，避免孤儿线程空转到 timeout
+
+
+_SELF_CALLBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# 回调接口实际接受的状态（handler.http_callback 的 done 分支与 progress/started/need_decision 分支）
+_CALLBACK_ACCEPTED_STATUSES = ("done", "failed", "progress", "started", "need_decision",
+                               "completed", "success")
+
+
+def _is_self_callback_url(notify_url: str) -> bool:
+    """通知地址是不是消息总线自己的回调接口（自发自收）。"""
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(notify_url or "")
+        if u.scheme not in ("http", "https") or u.hostname not in _SELF_CALLBACK_HOSTS:
+            return False
+        return u.path.rstrip("/").endswith("/callback")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[patrol] notify_url 解析失败，按「非自发」处理（回调侧仍会拒并留痕）: {e}")
+        return False
+
+
+def should_skip_self_notify(notify_url: str, status: str) -> bool:
+    """2611230966 乙（池#1284）：自发自收 + 状态不在回调接受集 → 跳过 POST。
+
+    主实例把 notify_url 登记成消息总线自己的 /callback；「done」能进，「TIMEOUT」49 次
+    全被 400 拒（handler 只认 done/failed/progress/started/need_decision），原来还要重试
+    3 次并把 notify_failed 写进任务台账。任务台账里已是超时状态，派单方查得到。
+    选方案 1（不扩回调接受面，只不发注定被拒的请求），本函数就是那条判断的单一入口。
+    """
+    return (_is_self_callback_url(notify_url)
+            and str(status or "").strip().lower() not in _CALLBACK_ACCEPTED_STATUSES)
 
 
 def _find_task_root(task_path: str) -> Optional[Path]:
@@ -332,6 +381,23 @@ def _check_output_completion_triple(
         )
         return False
 
+    # === Check 5/6（2611269903：巡检不再在执行者没交齐时判完成）===
+    # 背景：执行者落盘报告后还在等最后一组回归，巡检看到报告就判完成，
+    # 终态→副本被清→执行者的完成回调被统一回调命令拒。两个新条件：
+    # 5. 报告尾部机读块（末尾 ```yaml 段）写着 status: complete——读不到/读不出/
+    #    不是完成一律按「没写完成」不判（落在不悄悄放过的一侧）；
+    # 6. 任务目录静默满 10 分钟（最近一次文件改动在 600s 前）——真停摆的任务最多
+    #    晚十分钟被发现，这是有意的（注释即承诺）。
+    if not _report_says_complete(task_dir):
+        pstate.idle_confirmation_count = 0
+        logger.debug(f"[patrol] {task_id} 机读块未写完成——不判 done（2611269903）")
+        return False
+    if task_file_age_sec < 600:
+        pstate.idle_confirmation_count = 0
+        logger.debug(f"[patrol] {task_id} 任务目录静默未满十分钟"
+                     f"（{task_file_age_sec:.0f}s<600s）——不判 done（2611269903）")
+        return False
+
     # 累计 idle 确认
     pstate.idle_confirmation_count += 1
     logger.info(
@@ -347,6 +413,24 @@ def _check_output_completion_triple(
     # 重置以便下次（如宽限检测）能再次判定
     pstate.idle_confirmation_count = 0
     return True
+
+
+def _report_says_complete(task_dir: Path) -> bool:
+    """2611269903：报告尾部机读块（末尾 ```yaml 段）的 status 是 complete 才算。
+
+    读不到报告/没有机读块/读不出/不是 complete → False（按「没写完成」处理，
+    不判完成——落在一字不漏的一侧）。
+    """
+    try:
+        report = task_dir / "output" / "report.md"
+        text = report.read_text(encoding="utf-8", errors="replace")
+        tail = text[-3000:]
+        m = re.search(r"```yaml\s*\n(.*?)```", tail, re.S)
+        if not m:
+            return False
+        return bool(re.search(r"(?m)^status:\s*complete\s*$", m.group(1)))
+    except Exception:
+        return False
 
 
 def _scan_task_dir_latest_mtime(task_dir: Path, dispatch_start_time: float) -> float:
@@ -407,6 +491,37 @@ def _timeout_grace_decision(elapsed: float, timeout: int, grace_sec: int) -> str
     if elapsed <= timeout + grace_sec:
         return "wait"
     return "timeout"
+
+
+def _timeout_activity_decision(
+    latest_mtime: float,
+    watermark: Optional[float],
+    idle_cycles: int,
+    idle_required: int,
+) -> Tuple[str, float, int]:
+    """池 #826①：超时置态前的产出活动判定（模块级纯函数便于单测）。
+
+    超时到期（含二次确认窗口过后）每个巡逻周期调用一次：本轮扫到的
+    task_dir 最新 mtime 与上轮水位比——推进过 = 有产出活动（新文件或
+    mtime 更新，施工在途），抬水位并清零无活动计数；未推进 = 无新活动，
+    计数 +1，连续 idle_required 个周期才放行 TIMEOUT。首轮（watermark=
+    None）只立水位、按无活动计 1：无从比较，保守先不杀——真在途施工
+    下一轮 mtime 推进即自我纠正（最多多等一个周期）。
+
+    Returns:
+        (action, new_watermark, new_idle_cycles)
+        action: "active"  — 有活动，不置 TIMEOUT（外层发 WARN 告警）
+                "count"   — 无活动但未达连续阈值，不置 TIMEOUT（继续等）
+                "timeout" — 连续 idle_required 周期无活动，可置 TIMEOUT
+    """
+    if watermark is None:
+        return ("count", latest_mtime, 1)
+    if latest_mtime > watermark:
+        return ("active", latest_mtime, 0)
+    idle = idle_cycles + 1
+    if idle >= idle_required:
+        return ("timeout", latest_mtime, idle)
+    return ("count", latest_mtime, idle)
 
 
 def _suspend_in_window(state: Dict[str, Any], now: Optional[float] = None) -> bool:
@@ -666,6 +781,13 @@ def _start_patrol_thread(agent: "AgentBase", task_id: str, stop_event,
         """
         if not notify_url:
             return
+        # 2611230966 乙：自发自收且状态不被回调接受 → 只记一行日志，不发注定被拒的请求
+        if should_skip_self_notify(notify_url, status):
+            logger.info(
+                f"[patrol] {task_id} 跳过自发自收的通知：notify_url 是本机回调接口，"
+                f"status={status} 不在接受集，任务台账已有该状态（派单方可查 /task/{task_id}）"
+            )
+            return
         import urllib.request
         import json as _json
         import time as _time
@@ -681,8 +803,18 @@ def _start_patrol_thread(agent: "AgentBase", task_id: str, stop_event,
             "result": r,
         }
         payload = _json.dumps(body, ensure_ascii=False).encode()
+        # 2611231133：自发通知要带任务自己的派单凭据——回调接口强制模式后仍需能进。
+        # 进程内本来就有台账；读不到不算失败（record 期无影响，enforce 期会在回调侧被记缺）。
+        _cb_cred = ""
+        try:
+            _st_cb = task_state.load_state(task_id) or {}
+            _cb_cred = str(_st_cb.get("credential_id") or "").strip()
+        except Exception as _cb_e:  # noqa: BLE001 — 取不到凭据只影响强制模式下的自发通知
+            logger.warning(f"[2611231133] {task_id} 自发通知取凭据失败: "
+                           f"{type(_cb_e).__name__}: {_cb_e}")
+        _cb_headers = {"X-Callback-Credential": _cb_cred} if _cb_cred else None
         # Task596: 重试循环抽出为 _post_webhook_with_retry（可测化，行为零变化）
-        last_err = _post_webhook_with_retry(notify_url, payload)
+        last_err = _post_webhook_with_retry(notify_url, payload, extra_headers=_cb_headers)
         if last_err is None:
             logger.info(f"[patrol] {task_id} 已通知 caller {notify_url}: {status}")
             return
@@ -804,6 +936,11 @@ def _start_patrol_thread(agent: "AgentBase", task_id: str, stop_event,
         # 真实存活时长线，超时判定前的墙顶清算用。
         wall_start = time.time()
         loop_count = 0
+        # 池 #826①：超时活动判定闭包水位——首轮立水位，此后每个到期周期
+        # 比对 task_dir 最新 mtime 是否推进；无活动连续周期计数 + WARN 冷却锚。
+        _act_watermark = None
+        _act_idle_cycles = 0
+        _act_warn_last_mono = 0.0
         # Task 280 P1-9: patrol 退出时（终态/超时/异常/stop_event）统一清理 registry
         # Task 298 P0-2: tmux pipe-pane tee 到 process/full-log.md（任何退出路径都关 pipe）
         # 用手动 __enter__/__exit__ 而非 `with` 包裹——等价于 `with _dep("PipePaneContext")(...):`
@@ -910,6 +1047,23 @@ def _start_patrol_thread(agent: "AgentBase", task_id: str, stop_event,
                             )
                             task_state.append_warning(task_id, _w238)
                             logger.warning(_w238)
+                            # === 2611192130 J1: delivery_resent —— 重投落流（MEM#118115
+                            # 空白⑨：此前仅 stdout+task warnings，事件流内不可对账）。
+                            # fire-and-forget：重投链可用性 > 观测完整性。
+                            # agent=caller（主控视角，与 dispatch_delivery 对齐）；
+                            # state 无 caller 时降 nexus-monitor（注册名，Bug11 系统侧惯例——
+                            # 'xdr' 不在 AGENT_REGISTRY，会静默丢）。
+                            try:
+                                from nexusos_xdr import session_state as _ss_j1
+                                _ss_j1.emit_system_event(
+                                    str(_st238.get("caller") or "nexus-monitor"),
+                                    "delivery_resent",
+                                    detail=_w238,
+                                    target=f"task:{task_id}",
+                                    extra={"resend_ok": bool(_ok238), "why": _why},
+                                )
+                            except Exception:
+                                pass
                         elif _act == "fail":
                             # P1-B4 (Task 2611111774): fail 终态化前重读真源——ack 超窗
                             # 判定基于循环开头快照，与迟到 done 存在窗口竞争（1770 B4）。
@@ -1035,11 +1189,59 @@ def _start_patrol_thread(agent: "AgentBase", task_id: str, stop_event,
                                 elif cur is None or cur.get("status") in task_state.TERMINAL_STATES:
                                     return  # 已终态（回调抢先）或状态文件丢失，patrol 退出
                                 else:
-                                    task_state.update_status(task_id, "TIMEOUT",
-                                                             error=f"patrol 超时 {timeout}s 无完成信号（含 {TIMEOUT_GRACE_SEC}s 二次确认窗口）",
-                                                             end_reason="timeout")
-                                    _notify_caller("TIMEOUT", {"method": "patrol_timeout"})
-                                    return
+                                    # 池 #826①：置 TIMEOUT 前查 task_dir 产出活动——
+                                    # 有活动（mtime 推进/新增文件）= 施工在途，只发
+                                    # WARN 告警不置终态；连续 2 个巡逻周期无任何
+                                    # 活动才置 TIMEOUT（1740 形态修复：施工在途
+                                    # 长时间无 progress 回调不再被误标）。
+                                    _td_root826 = _find_task_root(task_path) if task_path else None
+                                    _latest_m826 = _act_watermark if _act_watermark is not None else 0.0
+                                    if _td_root826 is not None:
+                                        try:
+                                            _latest_m826 = _scan_task_dir_latest_mtime(
+                                                _td_root826, dispatch_start_time)
+                                        except Exception as _e826:
+                                            # 扫不动=按无变化处理：不阻塞超时收敛
+                                            logger.debug(f"[patrol] {task_id} 活动扫描异常（按无活动计）: {_e826}")
+                                    _act826, _act_watermark, _act_idle_cycles = _timeout_activity_decision(
+                                        _latest_m826, _act_watermark, _act_idle_cycles,
+                                        TIMEOUT_ACTIVITY_IDLE_CYCLES)
+                                    if _act826 != "timeout":
+                                        if _act826 == "active" and (
+                                            time.monotonic() - _act_warn_last_mono
+                                            >= TIMEOUT_ACTIVITY_WARN_COOLDOWN_SEC
+                                        ):
+                                            _act_warn_last_mono = time.monotonic()
+                                            _w826 = (
+                                                f"[patrol-timeout-active] {task_id} 超预算 "
+                                                f"{elapsed:.0f}s 但 task_dir 仍有产出活动"
+                                                f"（最新写入 {max(0.0, time.time() - _latest_m826):.0f}s 前）"
+                                                f"——施工在途不置 TIMEOUT，连续 "
+                                                f"{TIMEOUT_ACTIVITY_IDLE_CYCLES} 周期无活动才终态化（池 #826①）"
+                                            )
+                                            try:
+                                                task_state.append_warning(task_id, _w826)
+                                            except Exception:
+                                                pass
+                                            try:
+                                                from nexusos_xdr import session_state as _ss826
+                                                _ss826.append_event(agent="xdr", event_type="alert",
+                                                                    detail=_w826, target=task_id)
+                                            except Exception:
+                                                pass
+                                        logger.info(
+                                            f"[patrol] {task_id} 超时但 task_dir 有产出活动"
+                                            f"（判定={_act826}，无活动连续 "
+                                            f"{_act_idle_cycles}/{TIMEOUT_ACTIVITY_IDLE_CYCLES}），不置 TIMEOUT"
+                                        )
+                                        # 不 return——落循环尾等下一轮：活动持续=
+                                        # 继续监控；活动停止=计数到阈值自然终态化
+                                    else:
+                                        task_state.update_status(task_id, "TIMEOUT",
+                                                                 error=f"patrol 超时 {timeout}s 无完成信号（含 {TIMEOUT_GRACE_SEC}s 二次确认窗口 + 连续 {TIMEOUT_ACTIVITY_IDLE_CYCLES} 周期无产出活动）",
+                                                                 end_reason="timeout")
+                                        _notify_caller("TIMEOUT", {"method": "patrol_timeout"})
+                                        return
                             except Exception as e:
                                 logger.error(f"[patrol] {task_id} 超时标记失败: {e}")
                                 return

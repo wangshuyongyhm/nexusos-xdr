@@ -34,6 +34,7 @@ import time
 import uuid
 import fcntl
 import logging
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -400,8 +401,12 @@ def tmux_server_alive() -> bool:
 
 # T628 shim 真化：wrapper → 同对象别名（import 形态）。原 wrapper 的 patch 分叉：
 # patch.object(dispatchd, "_tmux_server_alive") 只对 patrol _dep() 生效，mcp_server
-# 直调公开名不变——两视角行为分叉（假绿风险）。真别名后 patch 任一名全视角生效
-# （_dep 属性解析 + 同对象双保险）。测试断言语义不变（is 锁定）。
+# 直调公开名不变——两视角行为分叉（假绿风险）。真别名消除的是 wrapper 调用层
+# 分叉，但同对象别名 ≠ 属性联动（2611172054 oc 实证，mcp_server.py:711 直调
+# 公开名）：运行时 patch 下划线名只影响「显式经下划线名解析的路径」（如 patrol
+# 的 _dep 属性解析）；直调公开名 tmux_server_alive() 的调用方不走下划线名，
+# patch 下划线名对它们不生效——反之 patch 公开名对 _dep 路径同样不生效。
+# 要全视角同步须两名一起 patch。测试断言语义不变（is 锁定）。
 _tmux_server_alive = tmux_server_alive
 
 AUTO_RELOCATE = _ve.SCRIPTS_DIR / "auto-relocate.sh"
@@ -734,6 +739,10 @@ def _cleanup_dispatched_copy(task_path: str, task_id: str) -> None:
 # ============================================================================
 # Task 298 P0-2: tmux pipe-pane 接入（process/full-log.md 自动生成）
 # ============================================================================
+# Task 2611230851: 过程日志写入上限（256KB）。Markdown 有界，超出部分进同目录 gz。
+PROCLOG_MAX_BYTES = 262144
+
+
 class PipePaneContext:
     """Task 298 P0-2: tmux pipe-pane 上下文管理器。
 
@@ -816,7 +825,28 @@ class PipePaneContext:
 
         可注入：测试可覆盖此方法验证命令构造。
         """
-        return f"{self._ANSI_STRIP_CMD} >> '{self.log_path}'"
+        # 原行为（保留以便回退/对照）：
+        # return f"{self._ANSI_STRIP_CMD} >> '{self.log_path}'"
+        return (
+            f"{self._ANSI_STRIP_CMD} | {self._build_log_filter_cmd()} "
+            f"|| {{ {self._ANSI_STRIP_CMD} >> {shlex.quote(str(self.log_path))}; }}"
+        )
+
+    def _build_log_filter_cmd(self) -> str:
+        """Task 2611230851: 上限闸命令段（perl 过滤之后的落盘端）。
+
+        - 解释器用派单服务自己的 sys.executable（与环境一致），模块靠包名，不写死路径
+        - PYTHONPATH 指向包所在 src 目录：pipe-pane 起的是独立 shell，拿不到派单进程的 sys.path
+        - 回退局限：管道是流式的，`||` 只救得回「过滤程序一开始就起不来」的情形
+          （那时左侧 perl 立刻 SIGPIPE、没吃输入）；跑到中途才失败只丢尾部，但不会让
+          执行者的输出没人接（pipe-pane 本身还活着）
+        """
+        src_dir = Path(__file__).resolve().parents[1]
+        py = sys.executable or "python3"
+        return (
+            f"PYTHONPATH={shlex.quote(str(src_dir))} {shlex.quote(py)} "
+            f"-m nexusos_xdr.proclog_filter {shlex.quote(str(self.log_path))} {PROCLOG_MAX_BYTES}"
+        )
 
     def __enter__(self) -> "PipePaneContext":
         # process/ 目录不存在要 mkdir

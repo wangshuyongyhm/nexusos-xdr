@@ -25,11 +25,91 @@
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
-# 1414 分身派生：多开实例（zcode2）的 pending 文件带后缀——按 NEXUS_ZCODE_AGENT_NAME
-# 派生（与 nexus-broadcast-lib.sh 同规则），env 缺省=zcode 时为原路径，主实例零回归。
-_AGENT_NAME = os.environ.get("NEXUS_ZCODE_AGENT_NAME", "zcode")
+# ---- 运行痕迹：每次运行往 ~/.zcode/nexus-hook-trace.log 追加一行，回答「这次 hook 以什么身份、凭什么跑的」----
+TRACE_FILE = Path.home() / ".zcode" / "nexus-hook-trace.log"
+
+
+def _read_stdin() -> dict:
+    """hook 的输入 JSON 只读一次并缓存（身份解析和 main 都要用）。
+
+    人在终端里直接跑这个脚本时 stdin 是终端，就不读了，免得卡住等输入。
+    """
+    if sys.stdin is None or sys.stdin.isatty():
+        return {}
+    try:
+        data = json.load(sys.stdin) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+_STDIN = _read_stdin()
+
+
+def _lookup_session(session: str) -> str:
+    """拿会话 ID 查会话映射表 ~/.zcode/nexus-session-map.tsv（每行 <会话 ID>\t<实例名>），查不到返回空串。"""
+    if not session:
+        return ""
+    try:
+        for line in (Path.home() / ".zcode" / "nexus-session-map.tsv").read_text(encoding="utf-8").splitlines():
+            sid, _, name = line.partition("\t")
+            if sid == session and name.strip():
+                return name.strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _resolve_identity() -> tuple:
+    """返回 (实例名, 命中来源)。
+
+    顺序与 bash 脚本 nexus-agent-identity.sh 一致：环境变量注入 > 会话映射表 > 缺省 zcode。
+    查映射表有两个会话 ID 来源，先 hook 输入里的 session_id，再环境变量 CLAUDE_SESSION_ID——
+    这两个 ZCode 都只在指南里声明过，本机没有实测，所以都试；痕迹里会记下各自有没有。
+    用标准库内联而不去调 Vault 里的脚本：hook 进程用哪个 python3、能否 import 到 Vault 的包都不受控。
+    """
+    injected = os.environ.get("NEXUS_ZCODE_AGENT_NAME")
+    if injected:
+        return injected, "env"
+    for session, source in (
+        (str(_STDIN.get("session_id") or "").strip(), "stdin"),
+        (os.environ.get("CLAUDE_SESSION_ID", "").strip(), "env_session"),
+    ):
+        name = _lookup_session(session)
+        if name:
+            return name, source
+    return "zcode", "default"
+
+
+_AGENT_NAME, _IDENTITY_SOURCE = _resolve_identity()
+
+
+def _write_trace() -> None:
+    """写一行运行痕迹。写不进去就算了——痕迹是观测件，不能反过来影响 hook 本职。"""
+    try:
+        event = _STDIN.get("hook_event_name") or _STDIN.get("event") or ""
+        for arg in sys.argv[1:]:
+            if arg.startswith("--event="):
+                event = arg.split("=", 1)[1]
+                break
+        stop_behavior = "block" if event == "Stop" and _read_pending() else "-"
+        with TRACE_FILE.open("a", encoding="utf-8") as f:
+            f.write(
+                f"{datetime.now().astimezone().isoformat(timespec='seconds')} "
+                f"event={_STDIN.get('hook_event_name') or _STDIN.get('event') or ''} "
+                f"agent={_AGENT_NAME} source={_IDENTITY_SOURCE} "
+                f"has_stdin_sid={int(bool(str(_STDIN.get('session_id') or '').strip()))} "
+                f"has_env_sid={int(bool(os.environ.get('CLAUDE_SESSION_ID', '').strip()))} "
+                f"stdin_keys={','.join(sorted(_STDIN.keys()))} "
+                f"stop_behavior={stop_behavior}\n"
+            )
+    except OSError:
+        pass
+
+
 _AGENT_SUFFIX = _AGENT_NAME.removeprefix("zcode")
 PENDING_FILE = Path.home() / ".zcode" / f"nexus-broadcast-pending{_AGENT_SUFFIX}.jsonl"
 
@@ -98,14 +178,8 @@ def _format_wake(pending_items: list) -> str:
 
 
 def main():
-    # 读 stdin（含 hook_event_name 等元信息），失败容错
-    stdin_data = {}
-    try:
-        stdin_data = json.load(sys.stdin) or {}
-        if not isinstance(stdin_data, dict):
-            stdin_data = {}
-    except Exception:
-        pass
+    _write_trace()
+    stdin_data = _STDIN
 
     pending = _read_pending()
     if not pending:
@@ -132,8 +206,8 @@ def main():
         },
     }
     if event_name == "Stop":
-        # Stop 时请求 Agent 继续（让它处理 pending）
-        output["hookSpecificOutput"]["stopHookEndBehavior"] = "continue"
+        # Stop 时有待收 → 强制处理（2026-11-23 用户裁定：block；重复触发由 ZCode 内置三次上限兜底）
+        output["hookSpecificOutput"]["stopHookEndBehavior"] = "block"
 
     print(json.dumps(output, ensure_ascii=False))
     sys.exit(0)

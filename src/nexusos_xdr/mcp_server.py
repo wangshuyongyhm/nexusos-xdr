@@ -38,6 +38,7 @@ from typing import Optional
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _AUTO_DIR = _SCRIPT_DIR.parent  # 自动化脚本/
 # Task 282 P2-3: sys.path 初始化改用 nexus.paths_setup 单源（原 for 循环 hack 删）
+from nexusos_xdr import __version__
 from nexusos_xdr import _vault_env as _ve  # Task668: 包内自足（干净环境 no-op）
 _ve.setup_sys_path()
 
@@ -45,11 +46,12 @@ from fastmcp import FastMCP
 from fastmcp.server.middleware import AuthMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.middleware import Middleware
 
 from nexusos_xdr import dispatchd
 from nexusos_xdr import task_state
 from nexusos_xdr import session_state
-from nexusos_xdr.mcp_auth import nexus_mcp_auth  # 1417: MCP 层凭据中间件 auth check
+from nexusos_xdr.mcp_auth import nexus_mcp_auth, MCPHeaderAuthGate  # 1417 工具级分层 + 2611192325 握手层验签
 from nexusos_xdr import spill  # Task311 S1: callback 大 summary 外溢（LOAD 期校验配置）
 from nexusos_xdr.guards import execute_guard_global, DestructiveOperationError
 from nexusos_xdr._vault_env import VAULT_ROOT  # Task668: 包内自足（干净环境可解析）
@@ -77,10 +79,10 @@ except Exception:
 try:
     # T674 ②: 经 nexusos_xdr._vault_deps 解析——flip 后 venv 无 vault sys.path 时
     # 自动定位 vault 单源；真干净环境降级（与原 try/except 语义一致）。
-    from nexusos_xdr._vault_deps import write_checkpoint, recover, CHECKPOINT_READY as _CHECKPOINT_AVAILABLE
+    from nexusos_xdr._vault_deps import write_checkpoint, CHECKPOINT_READY as _CHECKPOINT_AVAILABLE
 except Exception as _cp_err:
     _CHECKPOINT_AVAILABLE = False
-    write_checkpoint = recover = None
+    write_checkpoint = None
     # Task524 P1-6: 降级分支不依赖 logger（此时 logger 尚未定义，引用会 NameError 炸启动）
     print(f"[checkpoint] nexus.checkpoint 加载失败，state_transition 钩子降级: {_cp_err}", file=sys.stderr)
 
@@ -132,26 +134,6 @@ def _on_state_transition_pass(scenario: str, context: dict, result: dict) -> Non
 if _CHECKPOINT_AVAILABLE and _ON_PASS_ENGINE_AVAILABLE:
     _register_on_pass_engine("state_transition", _on_state_transition_pass)
 
-
-def _on_loop_start_pass(scenario: str, context: dict, result: dict) -> None:
-    """loop_start gate passed → 若存在上次崩溃 checkpoint，把恢复指引塞进 result。
-
-    Task522: recover 读最新 checkpoint。Task531 B8: 按 session_id 筛（多 LOOP 并跑
-    防串会话，Task525 的 read_latest 已支持）——原无参 recover() 读任意最新。
-    首次 LOOP 无崩溃历史时 recover 返"无 checkpoint 可恢复"，不塞字段。
-    """
-    if not _CHECKPOINT_AVAILABLE:
-        return
-    try:
-        recovery = recover(context.get("session_id", ""))
-        if recovery and recovery != "无 checkpoint 可恢复":
-            result["loop_recovery"] = recovery  # 注入 gate 结果，主控读返回值即见
-    except Exception as _e:
-        logger.warning(f"[on_pass] loop_start recover 失败（不阻断 gate）: {_e}")
-
-
-if _CHECKPOINT_AVAILABLE and _ON_PASS_ENGINE_AVAILABLE:
-    _register_on_pass_engine("loop_start", _on_loop_start_pass)
 
 # === 日志 ===
 logging.basicConfig(
@@ -284,7 +266,7 @@ async def http_health(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "ok",
         "service": "nexusos-xdr",
-        "version": "1.0.0",
+        "version": __version__,
         "port": RUNTIME_PORT,
         "knowledge_base": "connected" if kb_ok else "disconnected",
         "agents": agents,
@@ -388,7 +370,7 @@ async def http_system_dump(request: Request) -> JSONResponse:
     agents, sessions, active_tasks, external_last_mile, credentials = await anyio.to_thread.run_sync(_dump_sync)
     return JSONResponse({
         "service": "nexusos-xdr",
-        "version": "1.0.0",
+        "version": __version__,
         "port": RUNTIME_PORT,
         "agents": agents,
         "sessions": sessions,
@@ -436,6 +418,13 @@ def _session_heartbeat_patrol_loop(stop_event=None):
                 logger.info("[session-patrol] 清理 %s 个 stale 会话", cleaned)
         except Exception as e:
             logger.error("[session-patrol] 巡检异常（不中断循环）: %s", e)
+        # 2611230959 甲：停摆看门狗挂到本守护线程——不依赖有没有人来查任务状态，
+        # 每 120s 固定驱动一轮（tick 内部单飞+2 分钟节流，出错它自己记警告日志）
+        try:
+            from nexusos_xdr.stall_watch import stall_watch_tick
+            stall_watch_tick()
+        except Exception as e:
+            logger.error("[session-patrol] 停摆看门狗触发异常（不中断循环）: %s", e)
         if stop_event is not None:
             if stop_event.wait(SESSION_PATROL_INTERVAL):
                 break
@@ -531,7 +520,7 @@ async def http_root(request: Request) -> JSONResponse:
     """根路径信息。"""
     return JSONResponse({
         "service": "nexusos-xdr",
-        "version": "1.0.0",
+        "version": __version__,
         "description": "所有 Agent 的通信协议层",
         "endpoints": {
             "mcp": "/mcp (streamable-http)",
@@ -796,11 +785,14 @@ def main():
     _httpapi_register_routes(mcp)
 
     # streamable-http 传输
+    # 2611192325：叠一层 ASGI 握手验签（只拦 /mcp，无凭据/假凭据 → 401）。
+    # 只给 /mcp 路径加闸，/health 与 /session//task/ 等 custom_route 不受影响。
     mcp.run(
         transport="streamable-http",
         host=args.host,
         port=args.port,
         path="/mcp",
+        middleware=[Middleware(MCPHeaderAuthGate)],
     )
 
 

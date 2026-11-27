@@ -23,6 +23,7 @@ auth check 里 get_http_request() 能读到 Authorization header（streamable-ht
 带凭据须自构造 httpx.AsyncClient 透传（探针实证的唯一正解）。
 """
 import logging
+import time
 
 from fastmcp.server.auth import AuthContext
 
@@ -100,3 +101,107 @@ async def nexus_mcp_auth(ctx: AuthContext) -> bool:
         import anyio
         return await anyio.to_thread.run_sync(_verify_cred_sync, auth_header, L2_CRED_TYPE)
     return False  # 其余工具：本批不开放
+
+# ============================================================================
+# 2611192325：/mcp 端点验签（ASGI 层）
+# ============================================================================
+# 背景：1417 的 AuthMiddleware 只做「工具级」分层（L0 匿名只读 / L1 写凭据 /
+# L2 调度权），**握手层不校验** —— 实测无 Authorization 的 POST /mcp 也 200，
+# 而且 TUI 配置里的 token 早在 2026-09-19 就过期了却一直"能用"，坐实了端点不验签。
+#
+# 本类补的是「HTTP 握手层」：`/mcp` 前缀的请求必须带有效 Bearer 凭据，否则 401。
+#   - 只拦 /mcp（/health、/session/*、/task/* 等 custom_route 一律放行——它们
+#     不是 MCP 协议面，且被 monitor/其他 Agent 无凭据调用）
+#   - 凭据接受 search_cred 或 l2_dispatch_cred（L1/L2 同源凭据体系，不新造 token）
+#   - 无 header / 格式错 / 过期 / 撤销 → 401（fail-closed，B12 语义）
+#   - 结果缓存：通过 60s、拒绝 10s —— MCP 每次请求都会带 header，不缓存等于
+#     每请求打一次 PG；拒绝侧短 TTL 保证「刚续期的凭据」10s 内可用。
+# 与工具级 AuthMiddleware 是**叠加**关系：这里过门，门内仍按 L0/L1/L2 分层。
+class MCPHeaderAuthGate:
+    """ASGI middleware：/mcp 握手层强制 Bearer 凭据。"""
+
+    MCP_PREFIX = "/mcp"
+    OK_TTL = 60.0
+    FAIL_TTL = 10.0
+    ACCEPTED_CRED_TYPES = ("search_cred", "l2_dispatch_cred")
+
+    def __init__(self, app, ok_ttl: float = 60.0, fail_ttl: float = 10.0):
+        self.app = app
+        self.OK_TTL = ok_ttl
+        self.FAIL_TTL = fail_ttl
+        self._cache: dict[str, tuple] = {}
+
+    # --- 内部 ---
+    def _is_mcp_path(self, path: str) -> bool:
+        return path == self.MCP_PREFIX or path.startswith(self.MCP_PREFIX + "/")
+
+    @staticmethod
+    def _extract_bearer(scope) -> str:
+        for k, v in scope.get("headers") or []:
+            if k.lower() == b"authorization":
+                raw = v.decode("latin-1").strip()
+                if raw.lower().startswith("bearer "):
+                    return raw[7:].strip()
+                return raw
+        return ""
+
+    def _verify(self, token: str) -> tuple:
+        """返回 (ok, reason)。带短 TTL 缓存。"""
+        now = time.time()
+        hit = self._cache.get(token)
+        if hit and hit[2] > now:
+            return hit[0], hit[1]
+        ok, reason = False, "无凭据"
+        if token:
+            try:
+                from nexusos_xdr.credential import verify_credential
+            except Exception as e:  # 凭据子系统不可用 → fail-closed 但留痕
+                logger.error(f"[MCPGate] credential 模块不可用（fail-closed）: {e}")
+                ok, reason = False, "凭据校验子系统不可用"
+            else:
+                reasons = []
+                for ct in self.ACCEPTED_CRED_TYPES:
+                    try:
+                        valid, detail = verify_credential(token, ct)
+                    except Exception as e:
+                        valid, detail = False, f"校验异常 {type(e).__name__}: {e}"
+                    if valid:
+                        ok, reason = True, f"{ct} 有效"
+                        break
+                    reasons.append(f"{ct}: {detail}")
+                if not ok:
+                    reason = "；".join(reasons)[:200]
+        self._cache[token] = (ok, reason, now + (self.OK_TTL if ok else self.FAIL_TTL))
+        return ok, reason
+
+    @staticmethod
+    async def _reject(send, reason: str) -> None:
+        import json as _json
+        body = _json.dumps({
+            "error": "unauthorized",
+            "detail": f"/mcp 需 Authorization: Bearer <search_cred|l2_dispatch_cred>（{reason}）",
+            "hint": "凭据三来源：①xdr register 响应的 search_credential_id ②dispatch 副本 frontmatter "
+                    "③静态文件 05-System/Agent/<name>/search_cred.txt",
+        }, ensure_ascii=False).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [(b"content-type", b"application/json; charset=utf-8"),
+                        (b"content-length", str(len(body)).encode()),
+                        (b"www-authenticate", b'Bearer realm="nexus-xdr"')],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    # --- ASGI 入口 ---
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not self._is_mcp_path(scope.get("path", "")):
+            await self.app(scope, receive, send)
+            return
+        token = self._extract_bearer(scope)
+        ok, reason = self._verify(token)
+        if ok:
+            await self.app(scope, receive, send)
+            return
+        logger.warning(f"[MCPGate] 401 {scope.get('method')} {scope.get('path')} from "
+                       f"{scope.get('client')} — {reason[:120]}")
+        await self._reject(send, reason)

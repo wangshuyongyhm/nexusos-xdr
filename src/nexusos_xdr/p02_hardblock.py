@@ -12,7 +12,7 @@
    1750 踩坑①②实证：主控代补抹形态 + 检查器活体修改致归因漂移——done 时点
    快照是历史归因唯一解。原子写（tmp+replace）防半截文件；禁 try/except 吞错。
 
-2. ``write_owner_claim_row`` — owner 认领行：锁内追加到未决问题池
+2. ``write_owner_claim_row`` — owner 认领行（七列规范行）：锁内追加到未决问题池
    （pool_write_channel 统一写通道，与 shell 封装同名锁互斥互通）。
    复核通道的登记载体：gate_blocked 非终态语义的出路之一（主控按行认领处置）。
 
@@ -27,6 +27,9 @@ import os
 import re
 import tempfile
 import threading
+import time
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -152,6 +155,37 @@ def snapshot_reject_context(
     return str(dst)
 
 
+def _owner_hint(task_id: str, task_path: str) -> str:
+    """池 #969-A: owner 归属推导——task_id 前缀 xdr-<agent>-* 优先，
+    task_path 形态 task/NN-*-<agent>-* 兜底（非硬编码名单）。"""
+    m = re.match(r"xdr-([a-z0-9]+)-", task_id or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"task/\d+(?:\.\d+)?-([a-z0-9]+)-", task_path or "")
+    return m.group(1) if m else "unknown"
+
+
+def _deadline_str(days: int = 7) -> str:
+    from datetime import datetime, timedelta
+
+    return (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def build_claim_row(task_id: str, code: str, snap: str, owner: str,
+                    deadline: str, day: str) -> str:
+    """拼 owner 认领行（七列规范行；只拼字符串，不读写，测试直接调）。
+
+    首格 [ ]（闭环后由认领者改 [x]），提出会话 xdr自动，状态 待办；
+    owner= 写在问题格，处置提示写在备注格。幂等锚「[gate_blocked] <task_id> 」留在问题格。
+    """
+    problem = (f"[gate_blocked] {task_id} REJECT={code or '?'} 未过硬拦已转复核"
+               f"（owner={owner}，处置: 修复产出后走 owner 认领/need_decision 裁决）"
+               f" 快照={snap} owner_hint={owner} deadline={deadline}"
+               f"（入池+7天，超期 pool-lifecycle-sweep 升级）")
+    note = "处置: 修复产出后重过 done gate 或请主控裁决"
+    return f"| [ ] | {problem} | P0-2硬拦自动入池 | {day} | xdr自动 | 待办 | {note} |\n"
+
+
 def write_owner_claim_row(
     task_id: str,
     task_path: str,
@@ -160,8 +194,10 @@ def write_owner_claim_row(
 ) -> None:
     """owner 认领行追加进未决问题池（pool_write_channel 锁内 append）。
 
-    行格式对齐既有池列（checkbox｜描述｜来源｜日期｜登记方）——G16 行同构，
-    但带 task_id+owner+快照指针，主控/owner 可直接定位处置。
+    行是七列规范行（口径见 persist-orchestrator §7 第 5 项），带 task_id+owner+快照指针，
+    主控/owner 可直接定位处置。
+    池 #969-A（2611192126）：行内追加 owner_hint（task_id/路径推导）+
+    deadline（入池+7天，pool-lifecycle-sweep.py 超期升级锚）。
     Raises: PoolWriteConflict/OSError 上抛（fail-loud，写痕已在通道内落）。
     """
     from nexusos_gate.pool_write_channel import pool_write_lock, commit_write
@@ -174,12 +210,8 @@ def write_owner_claim_row(
     snap = "no-snapshot"
     if snap_p is not None:
         snap = str(snap_p) if "gate-snapshots" in snap_p.parts else snap_p.name
-    today = _utcnow()[:10]
-    row = (
-        f"| [ ] | [gate_blocked] {task_id} REJECT={code or '?'} 未过硬拦已转复核"
-        f"（owner=任务目录归属人，处置: 修复产出后走 owner 认领/need_decision 裁决）"
-        f" 快照={snap} | P0-2硬拦自动入池 | {today} | xdr自动 |\n"
-    )
+    row = build_claim_row(task_id, code, snap, _owner_hint(task_id, task_path),
+                          _deadline_str(7), _utcnow()[:10])
     with pool_write_lock(pool):
         # P0-② (Task 2611111774) 第二道保险：池行 lookaround 锚（同 G16 :110 先例）
         # ——once_flag 是进程内单源，跨进程/重启后的重复 done 靠池锚兜底。
@@ -388,20 +420,23 @@ def hardblock_rejects(
         _fallback_claim(task_id, codes, snap, pool_err)
     emit_state_transition_event(
         task_id, f"gate_blocked: REJECT={codes} 快照={Path(snap).name} 待 owner 认领")
-    try:
-        _ts.append_callback(task_id, {
-            "source": "gate", "session": "p02-hardblock",
-            "status": "need_decision",
-            "summary": f"REJECT 硬拦转复核: {codes}；快照 {snap}",
-        })
-    except Exception as cb_err:  # noqa: BLE001 — callbacks 上限满等非致命，不阻断主链
-        logger.warning("[P0-2] %s need_decision 回调记录失败(不阻断): %s", task_id, cb_err)
-    try:
-        from nexusos_xdr.needdecision_notify import fire as _nd_fire
-
-        _nd_fire(task_id, f"gate_blocked 待复核: REJECT={codes}", source=source)
-    except Exception as nd_err:  # noqa: BLE001 — 通知链自带降级，最外层再兜
-        logger.warning("[P0-2] %s need_decision 通知失败(不阻断): %s", task_id, nd_err)
+    # Task 2611230853 件三：不再把每一次硬拦自动转成一条「请决策」（14 天 61 次里 54 次是这么来的）。
+    # 完成回调本身照常送达派单方（callback 通道不变），派单方从回调就能看到被拦。
+    # 显形改走三处：/task_state 的 blocked_* 汇总字段、gate_debt_tick 的 48h 日汇总告警、
+    # 以及池里的 owner 认领行（上面已写）。原实现注释保留：
+    # try:
+    #     _ts.append_callback(task_id, {
+    #         "source": "gate", "session": "p02-hardblock",
+    #         "status": "need_decision",
+    #         "summary": f"REJECT 硬拦转复核: {codes}；快照 {snap}",
+    #     })
+    # except Exception as cb_err:
+    #     logger.warning("[P0-2] %s need_decision 回调记录失败(不阻断): %s", task_id, cb_err)
+    # try:
+    #     from nexusos_xdr.needdecision_notify import fire as _nd_fire
+    #     _nd_fire(task_id, f"gate_blocked 待复核: REJECT={codes}", source=source)
+    # except Exception as nd_err:
+    #     logger.warning("[P0-2] %s need_decision 通知失败(不阻断): %s", task_id, nd_err)
     logger.warning("[P0-2] %s REJECT 硬拦完成: %s（快照 %s，已转复核）",
                    task_id, codes, snap)
     return state
@@ -415,3 +450,68 @@ def _utcnow() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+# === Task 2611230853 件三：被硬拦超 48h 的日汇总告警（一天最多一条）===
+_DEBT_FILE = Path.home() / ".nexus" / "xdr" / "gate-debt.jsonl"
+_DEBT_TICK_LAST = 0.0
+_DEBT_TICK_INTERVAL = 300.0   # patrol 秒级轮询下别每轮都扫
+
+
+def gate_debt_tick() -> None:
+    """读欠账 → 若当天还没记过账且存在超 48h 的被拦任务，发一条 alert 并记账。
+
+    为什么用 end_reason 而不是新状态：TERMINAL_STATES 被哨兵脚本硬编码，动枚举全线出问题；
+    被拦任务的 status 一直是 DONE，靠 end_reason=gate_blocked + 汇总字段 + 告警显形。
+    """
+    global _DEBT_TICK_LAST
+    now = time.time()
+    if now - _DEBT_TICK_LAST < _DEBT_TICK_INTERVAL:
+        return
+    _DEBT_TICK_LAST = now
+    try:
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        if _DEBT_FILE.exists():
+            for line in _DEBT_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-50:]:
+                try:
+                    if json.loads(line).get("date") == today:
+                        return
+                except json.JSONDecodeError:
+                    continue
+        from nexusos_xdr import task_state as _ts  # 局部导入：task_state→p02 是反向依赖，避免循环
+        rows = _ts.list_recent(limit=5000) or []
+        blocked, over = [], []
+        for r in rows:
+            if str(r.get("end_reason") or "") != "gate_blocked":
+                continue
+            blocked.append(r.get("task_id"))
+            ts = str(r.get("finished") or r.get("created") or "")
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+            except Exception:
+                continue
+            if hours >= 48:
+                over.append((r.get("task_id"), round(hours, 1)))
+        if not over:
+            return
+        oldest = max(h for _, h in over)
+        ids = ", ".join(str(t) for t, _ in over[:5])
+        detail = f"被拦超 48 小时 {len(over)} 单，最老 {oldest:.1f} 小时，编号：{ids}"
+        try:
+            body = json.dumps({"agent": "xdr", "type": "alert", "detail": detail},
+                              ensure_ascii=False).encode()
+            req = urllib.request.Request(_events_url(), data=body,
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=3).close()
+        except Exception as e:  # noqa: BLE001 — 观测件，发不出去不影响
+            logger.warning("[gate-debt] alert 发送失败(不阻断): %s", e)
+        _DEBT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _DEBT_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"date": today, "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                "blocked_total": len(blocked), "over_48h": len(over),
+                                "oldest_hours": round(oldest, 1)}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass

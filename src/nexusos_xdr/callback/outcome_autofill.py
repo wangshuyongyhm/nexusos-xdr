@@ -30,6 +30,7 @@
 调用方：callback/handler.py `_bg_gate_check` 尾巴（flag 分支内 lazy import）。
 """
 
+from nexusos_xdr.task_aliases import task_id_aliases
 import logging
 import os
 
@@ -82,7 +83,7 @@ def _pending_attempts(task_id: str) -> list:
             """
             SELECT a.id, a.target_id, a.created
             FROM agent_activity a
-            WHERE a.action='apply_attempt' AND a.task_id=%s
+            WHERE a.action='apply_attempt' AND a.task_id = ANY(%s)
               AND (a.outcome IS NULL OR a.outcome='pending')
               AND NOT EXISTS (
                   SELECT 1 FROM agent_activity o
@@ -98,7 +99,7 @@ def _pending_attempts(task_id: str) -> list:
                     AND o.detail->>'result' != 'pending')
             ORDER BY a.id
             """,
-            (task_id,),
+            (task_id_aliases(task_id, ""),),
         )
         rows = [
             {"id": r[0], "target_id": r[1], "created": r[2]}
@@ -186,6 +187,10 @@ def autofill_for_task(task_id: str, body: dict) -> dict:
                 exp_id=attempt["target_id"],
                 result=result,
                 evidence=evidence,
+                by="system/outcome-autofill",  # 2611230944 甲-6
+                on_behalf=True,
+                entry="system",
+                system_flow="outcome-autofill",  # 2611230960 乙：显式系统流程参数
             )
             ret["filled"] += 1
         except Exception as e:

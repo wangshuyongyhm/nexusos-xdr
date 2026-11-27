@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexusos-xdr"
-version = "1.1.0"
+version = "1.2.0"
 description = "NEXUS-XDR — Agent 调度总线（dispatch/callback/presence/patrol + MCP :19998）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,7 @@ classifiers = ["License :: OSI Approved :: MIT License"]
 # 硬依赖让干净环境单装 xdr 直接解析失败；mem 接入点已容错——
 # nexusos_xdr._mem_compat，缺包时用到才报清晰安装指引）。
 dependencies = [
-    "nexusos-gate>=1.1.0",
+    "nexusos-gate>=1.2.0",
     "nexusos-common>=1.0,<2",  # 1957 锚点单源
     "fastmcp>=3.4.4,<3.5",
     "anyio>=4.0",

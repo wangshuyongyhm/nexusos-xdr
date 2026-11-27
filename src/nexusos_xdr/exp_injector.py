@@ -303,7 +303,8 @@ def _search(query: str, tag: str = None, knowledge_type: str = None,
     """
     try:
         kb = _get_kb()
-        results = kb.search(query, top_k=DEFAULT_TOP_K, tag=tag, knowledge_type=knowledge_type)
+        # 2611230887：这是系统替执行者查经验、打包进任务书，没有哪个 Agent 在干活时看到了检索结果——不记套用。
+        results = kb.search(query, top_k=DEFAULT_TOP_K, tag=tag, knowledge_type=knowledge_type, annotate=False)
         # 可选：要求精确匹配（防语义搜索太宽泛）
         if require_match and query:
             query_lower = query.lower()

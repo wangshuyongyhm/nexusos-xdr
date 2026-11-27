@@ -10,13 +10,65 @@
 本 hook 把"自检证据化"从"靠自觉"升级到"代码强制提醒"。
 """
 import json
+import os
 import re
 import sys
+from datetime import datetime
+from pathlib import Path
+
+
+# ---- 运行痕迹：守卫真触发时往 ~/.zcode/nexus-hook-trace.log 追加一行，回答「它到底触发过没有」----
+TRACE_FILE = Path.home() / ".zcode" / "nexus-hook-trace.log"
+
+
+def _resolve_identity(stdin_data: dict) -> tuple:
+    """返回 (窗口身份, 命中来源)。
+
+    取法与部署位 broadcast_guard.py 的同名实现一致（环境变量 > 会话映射表 > 缺省 zcode）。
+    不 import 它：broadcast_guard 在模块级读 stdin，import 会把本 hook 的输入吃掉。
+    """
+    injected = os.environ.get("NEXUS_ZCODE_AGENT_NAME")
+    if injected:
+        return injected, "env"
+    try:
+        rows = (Path.home() / ".zcode" / "nexus-session-map.tsv").read_text(
+            encoding="utf-8").splitlines()
+    except OSError:
+        rows = []
+    for session, source in (
+        (str(stdin_data.get("session_id") or "").strip(), "stdin"),
+        (os.environ.get("CLAUDE_SESSION_ID", "").strip(), "env_session"),
+    ):
+        if not session:
+            continue
+        for line in rows:
+            sid, _, name = line.partition("\t")
+            if sid == session and name.strip():
+                return name.strip(), source
+    return "zcode", "default"
+
+
+def _write_trace(stdin_data: dict, guard: str, missing: list) -> None:
+    """写一行触发痕迹。写不进去就算了——痕迹是观测件，不能反过来影响守卫本职。"""
+    agent, source = _resolve_identity(stdin_data)
+    try:
+        with TRACE_FILE.open("a", encoding="utf-8") as f:
+            f.write(
+                f"{datetime.now().astimezone().isoformat(timespec='seconds')} "
+                f"event={stdin_data.get('hook_event_name') or 'Stop'} "
+                f"guard={guard} agent={agent} source={source} "
+                f"result=reminded missing={';'.join(missing)}\n"
+            )
+    except OSError:
+        pass
 
 
 def _extract_reply_text(data: dict) -> str:
     """从 Stop hook stdin 提取回复文本（字段名实测多版本兼容）。"""
-    for k in ("response", "reply", "output", "text", "assistant_response", "message"):
+    # 2611230843：宿主 Stop 输入实际键是 responseText / last_assistant_message（痕迹文件实证），
+    # 旧键保留在后以兼容旧宿主——原写法只认旧键，一个都对不上 → 拿不到文本即静默退出。
+    for k in ("responseText", "last_assistant_message", "response", "reply", "output",
+              "text", "assistant_response", "message"):
         v = data.get(k)
         if isinstance(v, str) and v:
             return v
@@ -77,6 +129,7 @@ def main():
                 + "\n自检不能走过场——必须有证据支撑（不是\"我觉得\"）。补全后再结束。"
             ),
         }
+        _write_trace(data, "selfcheck_evidence", missing)
         print(json.dumps(output, ensure_ascii=False))
 
     sys.exit(0)

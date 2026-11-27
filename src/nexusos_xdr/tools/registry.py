@@ -202,7 +202,8 @@ def search_knowledge(query: str, top_k: int = 5, project: str = "", task_id: str
                 top_k=top_k,
                 project=project or None,
                 task_id=task_id or None,
-                annotate=bool(task_id),
+                # 2611230887：没有调用者身份时不记（实例身份 nexusos-xdr 是机器兜底身份）；有身份照记。
+                annotate=bool(task_id and agent_id),
             )
         return {
             "query": query,
@@ -239,6 +240,7 @@ def apply_experience_outcome(
     result: str,
     evidence: str = "",
     agent_id: str = "",
+    credential: str = "",  # 2611230944 丙：写操作必须带凭据（search_cred），持有者须等于 agent_id
 ) -> str:
     """主控套用经验后回填真实结果（认知诚实闭环关键，B+ 方案 Task527）。
 
@@ -257,6 +259,20 @@ def apply_experience_outcome(
     """
     try:
         _src = agent_id or "mcp"
+        # 2611230944 丙：MCP 写入口——调用方身份不可核验（工具层无会话/凭据可核），
+        # 要求参数带凭据并校验持有者等于自报身份；缺凭据/校验失败 → 明确错误（不许留不设防的写入口）
+        if not credential:
+            return json.dumps({
+                "ok": False,
+                "error": "MCP 写结果必须带 credential 参数（search_cred），且凭据持有者须等于 agent_id",
+            }, ensure_ascii=False)
+        try:
+            from nexusos_xdr.credential import verify_credential as _vc944m
+            _v944m, _d944m = _vc944m(credential, "search_cred", _src)
+        except Exception as _ce944m:
+            return json.dumps({"ok": False, "error": f"凭据校验出错（写入口不放行）: {type(_ce944m).__name__}"}, ensure_ascii=False)
+        if not _v944m:
+            return json.dumps({"ok": False, "error": f"凭据无效: {_d944m}"}, ensure_ascii=False)
         # SharedKnowledge 顶层未 import（get_kb 模式是函数内局部 import）
         from nexusos_mem.shared import SharedKnowledge
         # 场景8: record_apply_outcome 是 DB 写路径，与 _kb_lock 保护的
@@ -268,6 +284,8 @@ def apply_experience_outcome(
                 exp_id=exp_id,
                 result=result,
                 evidence=evidence,
+                by=_src,  # 2611230944：调用方身份=凭据持有者
+                entry="mcp",
             )
         return json.dumps(_r, ensure_ascii=False)
     except ValueError as e:
@@ -645,6 +663,8 @@ def _issue_search_cred(agent: str, role: str) -> Optional[str]:
             _cred_file = VAULT_ROOT / "05-System" / "Agent" / agent / "search_cred.txt"
             _cred_file.parent.mkdir(parents=True, exist_ok=True)
             _cred_file.write_text(cred_id, encoding="utf-8")
+            # 2611230963 戊：静态凭据文件收紧到 0600（红队四轮 R4-5：原来是 0644 全机可读）
+            os.chmod(_cred_file, 0o600)
         return cred_id
     except Exception as _e:
         logger.debug(f"[Task472] search_cred 签发失败（fail-open）: {_e}")

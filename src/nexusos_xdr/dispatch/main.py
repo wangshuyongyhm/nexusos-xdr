@@ -31,6 +31,25 @@ logger = logging.getLogger("nexusos-xdr.dispatchd")  # 保持宿主 logger 名�
 _deps = None
 
 
+
+def dispatch_gate_decision(result):
+    """Task 2611230853 件二：门禁结果 → 派单决策（纯函数，便于测试）。
+
+    返回 (decision, reason)：
+      ("block", 硬拦原因) —— passed=False 且 hard_fails 非空：不派
+      ("pass", 说明)      —— 通过，或只有 WARN（维持原 fail-open 的宽容面）
+      ("unknown", 说明)   —— 门禁不可用/抛异常：放行并标 unknown
+    """
+    if result is None:
+        return "unknown", "gate 不可用（fail-open）"
+    hard = result.get("hard_fails") or []
+    if result.get("passed") is False and hard:
+        return "block", " | ".join(
+            f"{r.get('id', '?')}: {str(r.get('detail', ''))[:120]}" for r in hard)
+    if result.get("passed"):
+        return "pass", "gate passed"
+    return "pass", "只有 WARN，不拦"
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """原子写任务书副本（Task1594 池#234 批次2 D1）。
 
@@ -39,6 +58,8 @@ def _atomic_write_text(path: Path, text: str) -> None:
     同目录 tmp + fsync + os.replace：tmp 与目标同目录=同卷结构保证，rename
     原子让半截对读者不可见（1563 C4 双盘 100 轮 100% 可靠）。
     失败清理 tmp 后重抛——副本写失败走调用方既有 fallback（原路径继续派发）。
+    2611230963 戊：副本 frontmatter 含凭据号，写完收紧到 0600（本函数所有
+    调用点都是任务书副本，单点收紧）。
     """
     _fd, _tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-aw-", suffix=".md")
     try:
@@ -47,6 +68,8 @@ def _atomic_write_text(path: Path, text: str) -> None:
             _f.flush()
             os.fsync(_f.fileno())
         os.replace(_tmp, str(path))
+        # 2611230963 戊：副本含凭据号 → 0600
+        os.chmod(path, 0o600)
     except Exception:
         try:
             os.unlink(_tmp)
@@ -561,6 +584,21 @@ def dispatch(
                 "target_agent": to,
             }, agent=caller)
             _dispatch_gate_passed = _disp_gate_result.get("passed", False)
+            # Task 2611230853 件二：派单门禁真拦（原 fail-open 行为注释保留在文件末尾说明）
+            # 有 REJECT 硬拦项 → 不派：按派单接口已有失败格式抛 DispatchError（带 hard_fails 原文）。
+            # 任务记录在更早的 create_task 已落盘，无法真正"不注册"——就地置 FAILED 并写 error，
+            # 避免留下悬挂的 PENDING 记录（状态枚举不动，见 task_state.TERMINAL_STATES 注释）。
+            _gate_decision, _gate_reason = dispatch_gate_decision(_disp_gate_result)
+            if _gate_decision == "block":
+                _hard_txt = _gate_reason
+                logger.warning(f"[Task393][{task_id}] dispatch gate 硬拦，不派单: {_hard_txt}")
+                try:
+                    task_state.update_status(task_id, "FAILED", end_reason="dispatch_gate_blocked",
+                                            error=f"dispatch gate 硬拦: {_hard_txt}")
+                except Exception as _hb:
+                    logger.warning(f"[Task393][{task_id}] 硬拦落库失败（不掩盖抛错）: {_hb}")
+                from nexusos_xdr.dispatchd import DispatchError as _DErr
+                raise _DErr(f"dispatch gate 硬拦，未派单: {_hard_txt}", status_code=400)
             _gate_warns = [f"{r.get('id','?')}" for r in _disp_gate_result.get("warns", [])]
             if not _dispatch_gate_passed:
                 logger.warning(f"[Task393] {task_id} dispatch gate REJECT: "
@@ -610,10 +648,14 @@ def dispatch(
                     task_id=task_id,  # Task563: 小弟 search 凭据绑任务（api 反查兜底）
                 )
                 if _search_cred_id:
-                    task_state.update_field(task_id, "search_credential_id", _search_cred_id)
+                    # 2611230963 戊：台账不再落明文检索凭据号（主控核查：该字段无读取方），
+                    # 只写打码引用；派单凭据 credential_id 是回调校验要读的，不动
+                    from nexusos_xdr.credential import mask_credential_ref
+                    task_state.update_field(task_id, "search_credential_id",
+                                            mask_credential_ref(_search_cred_id))
                     logger.info(f"[Task441][{task_id}] search 凭据已签发: {_search_cred_id}")
                 else:
-                    logger.warning(f"[Task441][{task_id}] search 凭据签发失败（fail-open）")
+                    logger.warning(f"[Task441][{task_id}] search 凭据签发失败（fail-open；可能原因：机器名单内身份不签发/凭据库异常，详见 credential 日志）")
             except Exception as _sc_e:
                 logger.warning(f"[Task441][{task_id}] search 凭据签发异常（fail-open）: {_sc_e}")
 
@@ -726,7 +768,21 @@ def dispatch(
         except Exception as _e:
             logger.warning(f"[Task325] 写 task 上下文文件失败（不阻塞）: {_e}")
 
-        if not agent.send_task(str(dispatched_path), task_id):
+        _delivery_ok = bool(agent.send_task(str(dispatched_path), task_id))
+        # === 2611192130 J1: dispatch_delivery —— 实际投递结果落流（MEM#118115：
+        # dispatch 类型 11 月绝迹，投递成败无痕）。fire-and-forget（emit_system_event
+        # 内部吞异常），agent=caller 主控视角，delivered 字段供对账器判投递段。
+        try:
+            from nexusos_xdr import session_state as _ss_j1
+            _ss_j1.emit_system_event(
+                caller, "dispatch_delivery",
+                detail=f"{task_id} → {to} 投递{'成功' if _delivery_ok else '失败'}（send_task）",
+                target=f"task:{task_id}",
+                extra={"callee": to, "delivered": _delivery_ok},
+            )
+        except Exception as _dd_e:
+            logger.debug(f"[j1] dispatch_delivery 事件失败(不阻塞): {_dd_e}")
+        if not _delivery_ok:
             task_state.update_status(task_id, "FAILED", error="send_task 返回失败", end_reason="error")
             raise _dep('DispatchError')(f"send_task 到 {to} 失败", status_code=502)
 
@@ -872,7 +928,7 @@ def check_status(task_id: str) -> Dict[str, Any]:
     return {"task_id": task_id, "source": "xdr-state", **state}
 
 
-def cancel_task(task_id: str) -> Dict[str, Any]:
+def cancel_task(task_id: str, _internal_reason: Optional[str] = None) -> Dict[str, Any]:
     """取消任务。
 
     v0.4 ds2 修订: Ctrl+C 可能中断写操作致文件损坏。
@@ -882,7 +938,14 @@ def cancel_task(task_id: str) -> Dict[str, Any]:
     3. 等待 2s 让小弟清理
     4. 验证 task 目录文件完整性（md5 对比，如有 checkpoint）
     5. 更新状态 CANCELLED + 释放锁
+
+    2611230953: ``_internal_reason`` 是内部参数——只许停摆自动处置
+    （stall_watch，"stall-redispatch"）这一处使用，HTTP/MCP 取消接口不传
+    （它们的同意口径不变）；传了就在日志与台账里写明真实原因。
     """
+    # 2611230953：内部取消原因留痕（只有停摆处置会走到）
+    if _internal_reason:
+        logger.info(f"[cancel] {task_id} 内部取消原因: {_internal_reason}（非用户取消）")
     state = task_state.load_state(task_id)
     if state is None:
         raise _dep('DispatchError')(f"任务不存在: {task_id}", status_code=404)
@@ -966,7 +1029,7 @@ def cancel_task(task_id: str) -> Dict[str, Any]:
         # Task 281 P2-24: 修正注释 CANCELLED_CORRUPTED → CANCELLED（task_state TERMINAL_STATES 只有 CANCELLED）
         task_state.update_status(
             task_id, "CANCELLED",
-            error=f"用户取消；检测到文件损坏: {corrupted}",
+            error=f"{_internal_reason or '用户取消'}；检测到文件损坏: {corrupted}",
             end_reason="aborted",
         )
         logger.warning(f"[cancel] {task_id} 文件损坏: {corrupted}")
@@ -977,7 +1040,7 @@ def cancel_task(task_id: str) -> Dict[str, Any]:
             "message": f"已取消，但检测到 {len(corrupted)} 个文件可能损坏（Ctrl+C 中断写操作）: {corrupted}",
         }
 
-    task_state.update_status(task_id, "CANCELLED", error="用户取消", end_reason="aborted")
+    task_state.update_status(task_id, "CANCELLED", error=_internal_reason or "用户取消", end_reason="aborted")
 
     logger.info(f"[cancel] {task_id} 已取消，checkpoint 已保存，文件完整性正常")
     return {

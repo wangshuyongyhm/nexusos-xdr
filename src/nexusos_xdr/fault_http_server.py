@@ -62,7 +62,7 @@ class _Handler(BaseHTTPRequestHandler):
     do_GET = _handle
 
     def _reply(self, code, obj):
-        body = json.dumps(obj).encode("utf-8")
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

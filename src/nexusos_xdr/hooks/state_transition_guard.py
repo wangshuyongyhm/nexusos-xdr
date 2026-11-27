@@ -2,7 +2,7 @@
 """state_transition_guard.py — PreToolUse hook (Bash matcher).
 
 Task539 R7: dispatch 前强制 state_transition gate（LOOP 状态推进强制）。
-检测 tool_input.command 含 dispatch 信号 → 查 events.jsonl 近 60s 有无
+检测 tool_input.command 含 dispatch 信号 → 查 events.jsonl 近 300s 有无
 gate_check scenario=state_transition passed=True → 无则 deny。
 
 设计依据：state 是概念的、无单一文件可拦——路径A 拦 dispatch 信号反向要求
@@ -17,8 +17,42 @@ from datetime import datetime, timezone, timedelta
 
 
 # #75③ 文档/配置后缀——路径名（如 dispatch-orchestrator.md）里的 /dispatch 不是派发端点
+import hashlib
+import hmac
+from pathlib import Path
+
 _DOC_SUFFIX = r"\.(?:md|ya?ml|json|txt|py|sh|toml|plist)"
 
+
+
+# === Task 2611230853 件一：通过记录签名校验 ===
+# 密钥与引擎同源：~/.nexus/xdr/gate.sig（0600）。这里不 import gate 包——hook 进程用哪个
+# python3、能不能 import 到 Vault 的包都不受控，HMAC 本身标准库就够。
+_SIG_FILE = Path.home() / ".nexus" / "xdr" / "gate.sig"
+
+
+def _sig_key() -> bytes:
+    try:
+        raw = _SIG_FILE.read_bytes().strip()
+        return raw if len(raw) >= 16 else b""
+    except OSError:
+        return b""
+
+
+def _sig_ok(event: dict) -> bool:
+    """detail 里的 sig 必须等于 HMAC(密钥, 'scenario|agent|ts') 的前 16 位。"""
+    detail = str(event.get("detail") or "")
+    m = re.search(r"\bsig=([0-9a-f]{16})\b", detail)
+    key = _sig_key()
+    if not m or not key:
+        return False
+    agent = str(event.get("agent") or "")
+    ts = str(event.get("ts") or "")
+    if not agent or not ts:
+        return False
+    want = hmac.new(key, f"state_transition|{agent}|{ts}".encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:16]
+    return hmac.compare_digest(want, m.group(1))
 
 def _strip_quoted(s: str) -> str:
     """剥掉单/双引号内内容（层①）——引号内是教学文案/示例字面量，非真命令。"""
@@ -67,10 +101,12 @@ def _is_dispatch_command(cmd: str) -> bool:
     return False
 
 
-def _has_recent_state_transition_gate(within_seconds: int = 60) -> bool:
+def _has_recent_state_transition_gate(within_seconds: int = 300) -> bool:
     """查 events.jsonl 近 N 秒有无 gate_check scenario=state_transition passed=True。
 
     复用 Wave1 观测器的时区兜底逻辑（naive→UTC）。
+    2611230867：默认窗口 60→300。通过记录已带签名（2611230853），窗口只用来把门禁
+    和派单关联；主控在 60s 下一天被误拦四次，都是门禁跑完到投递之间的思考时间超了。
     """
     tz8 = timezone(timedelta(hours=8))
     cutoff = datetime.now(tz8) - timedelta(seconds=within_seconds)
@@ -86,7 +122,7 @@ def _has_recent_state_transition_gate(within_seconds: int = 60) -> bool:
         from nexusos_xdr.session_state import archive_path_today, now_iso
         p_today = archive_path_today()
         candidates.append(str(p_today))
-        # 跨日切兜底：60s 窗口可横跨 UTC 日切（gate 事件写在 UTC 昨日文件），
+        # 跨日切兜底：300s 窗口可横跨 UTC 日切（gate 事件写在 UTC 昨日文件），
         # 与 session_state.get_events 的 day_now/day_yesterday 双读同语义。
         day_now = now_iso()[:10]
         day_yesterday = (datetime.fromisoformat(day_now)
@@ -121,9 +157,16 @@ def _has_recent_state_transition_gate(within_seconds: int = 60) -> bool:
                     if e.get("type") != "gate_check":
                         continue
                     detail = e.get("detail", "") or ""
+                    # 原判据（Task 2611230853 件一）：字样子串任何 Agent 都能手写，已改签名校验
+                    # if "scenario=state_transition" not in detail:
+                    #     continue
+                    # if "passed=True" not in detail:
+                    #     continue
                     if "scenario=state_transition" not in detail:
                         continue
                     if "passed=True" not in detail:
+                        continue
+                    if not _sig_ok(e):
                         continue
                     ts = e.get("ts", "")
                     if not ts:

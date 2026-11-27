@@ -41,14 +41,29 @@ from nexusos_xdr import _vault_env as _ve  # Task668: 包内自足（干净环�
 _ve.setup_sys_path()
 
 from nexusos_xdr._mem_compat import MEM_MISSING_MSG  # Task1597: mem=[mem] extra 容错
-try:
-    from nexusos_mem.nexus_mem_utils import atomic_write_json, safe_read_json  # Task668 ②: 包路径（原平铺名 vault 级外泄）
-except ImportError:
-    # mem 缺席（干净环境单装 xdr）：import 不炸，读写在场台账时才报安装指引
-    def atomic_write_json(*_a, **_k):
+
+# G1(2611172053)：import 期一次性绑定改惰性解析——套件/复杂进程里
+# session_state 首次 import 时 nexusos_mem 可能处于「暂时不可 import」窗口
+# （前序测试的 sys.path/sys.modules 操作），旧实现会把 ImportError 兜底 stub
+# 永久烙进模块（unregister 族测试全量跑全灭实证）。惰性化后调用时重试，
+# 窗口恢复即自愈；mem 真缺席的干净环境语义不变（仍报 MEM_MISSING_MSG）。
+def _mem_utils():
+    from nexusos_mem.nexus_mem_utils import (  # Task668 ②: 包路径
+        atomic_write_json as _awj, safe_read_json as _srj)
+    return _awj, _srj
+
+
+def atomic_write_json(*_a, **_k):
+    try:
+        return _mem_utils()[0](*_a, **_k)
+    except ImportError:
         raise RuntimeError(MEM_MISSING_MSG)
 
-    def safe_read_json(*_a, **_k):
+
+def safe_read_json(*_a, **_k):
+    try:
+        return _mem_utils()[1](*_a, **_k)
+    except ImportError:
         raise RuntimeError(MEM_MISSING_MSG)
 
 logger = logging.getLogger("nexusos-xdr.session")
@@ -241,6 +256,19 @@ def register_agent(
     valid, reason = validate_agent(agent)
     if not valid:
         raise ValueError(reason)
+    # 2611230963 甲：主控名单校验——名单外的名字登记成主控一律拒绝并留事件；
+    # 主控登记必须带会话号（机器睡眠/离开后的重建链见 heartbeat_agent）
+    if role == "orchestrator":
+        from nexusos_xdr.agents import may_orchestrate  # 局部导入：避免循环依赖
+        if not may_orchestrate(agent):
+            try:
+                append_event(agent, "role_refused",
+                             detail=f"{agent} 申请登记为 orchestrator 被拒（不在主控名单）")
+            except Exception as _re:  # noqa: BLE001 — 留痕失败不掩盖拒绝本身
+                logger.warning(f"[presence] role_refused 事件留痕失败: {_re}")
+            raise ValueError(f"{agent} 不是主控名单内的名字，不能登记为主控")
+        if not str(session_id or "").strip():
+            raise ValueError("登记为主控必须带 session_id（会话号）——主控身份要能被追溯")
     with _sessions_lock():
         sessions = load_sessions()
         sessions[agent] = {
@@ -265,6 +293,7 @@ def heartbeat_agent(
     current_task: str = "",
     context_pct: Optional[int] = None,
     session_id: str = "",
+    role: str = "",
 ) -> Dict[str, Any]:
     """Agent 心跳更新（每 60s 调用）。
 
@@ -274,6 +303,10 @@ def heartbeat_agent(
         current_task: 当前任务描述
         context_pct: context 窗口占用率（可选）
         session_id: 会话标识（Task532 P-d2: 可选——归属维度，register 外也带）
+        role: 2611230963 乙：心跳透传角色——仅用于「记录不存在时的重建」：
+              带 orchestrator 且名字在主控名单（may_orchestrate）→ 重建成主控，
+              否则重建成执行者（防主控离开 15 分钟被清理后悄悄降级）；
+              记录已存在时角色与会话号不被心跳改变（保持现状）。
     Returns:
         更新后的完整在场景
     """
@@ -286,13 +319,24 @@ def heartbeat_agent(
     with _sessions_lock():
         sessions = load_sessions()
         if agent not in sessions:
-            # 未注册的心跳自动注册
+            # 2611230963 乙：重建按名单定角色（原固定 executor=主控悄悄降级），留事件
+            from nexusos_xdr.agents import may_orchestrate  # 局部导入：避免循环依赖
+            _recreated_role = ("orchestrator"
+                               if role == "orchestrator" and may_orchestrate(agent)
+                               else "executor")
             sessions[agent] = {
                 "agent": agent,
-                "role": "executor",
-                "session_id": "",
+                "role": _recreated_role,
+                "session_id": session_id or "",
                 "started": now_iso(),
             }
+            try:
+                append_event(agent, "presence_recreated",
+                             detail=f"心跳重建在场记录: role={_recreated_role}"
+                                    f"（申请 role={role or '未带'}）"
+                                    f" session_id={'有' if session_id else '无'}")
+            except Exception as _pe:  # noqa: BLE001 — 事件留痕失败不影响心跳
+                logger.warning(f"[presence] presence_recreated 事件留痕失败: {_pe}")
         entry = sessions[agent]
         entry["last_heartbeat"] = now_iso()
         entry["status"] = status
@@ -421,6 +465,43 @@ def append_event(
     return event
 
 
+# === 2611192130 J1 事件补全：系统侧事件发流辅助（nexus-journal 层1）===
+# 动机：MEM#118115 九空白——dispatch_delivery/callback_arrived/ack_consumed/
+# heartbeat/commit_done/readme_sync_checked/push_delivered/callback_missing/
+# delivery_resent 在源头无事件，六域生命周期断段不可对账。本辅助给源码侧
+# 一个 fire-and-forget 发流点（对抗①：事件发流失败不阻塞主流程——投递/
+# 回调/心跳的可用性 > 观测完整性），任何异常降级 stderr 一行不向上抛。
+# 去重：同 (agent, event_type) 60s 窗口只发首条（dedup=True 时启用，供
+# 万一被滥用的调用方兜底；heartbeat 的聚合策略在 presence/routes.py 独立
+# 实现——状态变化立即发+300s 保底跳，比通用 60s 去重更省量）。
+_SYSTEM_EVENT_LAST: Dict[tuple, float] = {}
+_SYSTEM_EVENT_DEDUP_SEC = 60.0
+
+
+def emit_system_event(agent: str, event_type: str, detail: str = "",
+                      target: str = "", extra: Optional[Dict] = None,
+                      dedup: bool = False) -> bool:
+    """发系统侧事件（fail-safe，可选去重）。返回是否真的落流。
+
+    与 append_event 的区别：append_event 校验失败抛 ValueError（协议客户端
+    该看到错误）；本辅助面向「观测不可靠但业务必须继续」的源码侧埋点，
+    身份未注册/写盘失败一律吞掉记 stderr，永不影响调用方主流程。
+    """
+    try:
+        if dedup:
+            import time as _time
+            key = (agent, event_type)
+            now = _time.monotonic()
+            if now - _SYSTEM_EVENT_LAST.get(key, 0.0) < _SYSTEM_EVENT_DEDUP_SEC:
+                return False
+            _SYSTEM_EVENT_LAST[key] = now
+        append_event(agent, event_type, detail=detail, target=target, extra=extra)
+        return True
+    except Exception as e:  # noqa: BLE001 —— 观测失败绝不阻塞业务主流程
+        print(f"[journal] 事件 {event_type} 发流失败(不阻塞): {e}", file=sys.stderr)
+        return False
+
+
 def get_events(since: str = "", limit: int = 100, agent_filter: str = "") -> List[Dict[str, Any]]:
     """读取事件流（增量轮询）。
 
@@ -435,7 +516,9 @@ def get_events(since: str = "", limit: int = 100, agent_filter: str = "") -> Lis
     from datetime import timedelta as _td
     day_now = now_iso()[:10]
     try:
-        _day_dt = datetime.fromisoformat(day_now)
+        # 2611192100 Q1f: 纯日期串用 strptime（原 fromisoformat 产出 naive datetime，
+        # 用于日期算术时无 tz 语义，混用隐患）
+        _day_dt = datetime.strptime(day_now, "%Y-%m-%d")
         day_yesterday = (_day_dt - _td(days=1)).strftime("%Y-%m-%d")
     except ValueError:
         day_yesterday = day_now

@@ -24,7 +24,7 @@ NOW_PREFIX = f"⏰ 当前本地时间 {datetime.now():%Y-%m-%d %H:%M}（以本�
 # 极简提醒（每轮注入，控制 <350 字符避免 context 膨胀）
 REMINDER = """🔴 本轮强制（_shared.md §交互铁律）：
 1. 动手前过 §0 分流：查 MEM 了吗？该用图谱用了吗？该派子 Agent 派了吗？
-2. 回复必含【认知四象限·KK/KU/UK/UU】+【待决事项】两段
+2. 报完成/选方向/改范围/kill/被纠偏时必含【认知四象限·证据绑定版】；每次回复带【待决事项】（无待决就写「本次无待决」）
 3. 一次只问一个问题（AskUserQuestion 单 question）
 4. 改文件前 POST /session/op-log 声明意图
 5. 子 Agent 只调研不改代码（代码走 dispatch）

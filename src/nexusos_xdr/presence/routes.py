@@ -1,3 +1,4 @@
+from nexusos_xdr.proc_origin import wrap as _origin_wrap
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """nexusos_xdr.presence.routes — NEXUS-PRESENCE HTTP 路由域（Task604 #57 批次③子包化试点）。
@@ -25,6 +26,10 @@ from starlette.responses import JSONResponse
 from nexusos_xdr import session_state
 
 logger = logging.getLogger("nexusos-xdr.presence")
+
+# === 2611192130 J1: heartbeat 落流聚合缓存（策略见 http_session_heartbeat docstring）===
+_HB_LAST_EVENT: Dict[str, tuple] = {}          # agent → ((status, task), monotonic_ts)
+_HB_MIN_INTERVAL_SEC = 300.0                   # 无变化保底跳间隔：每 agent 日 ≤288 条
 
 # 注入位（register_routes 时绑定；Task639 T3: 参数已改必传——漏传在启动期
 # TypeError fail-fast，而非运行期静默跳过签发。值仍可为 None——register 端点
@@ -54,14 +59,20 @@ def register_routes(mcp: Any, issue_search_cred: Callable[[str, str], Optional[s
     global _issue_search_cred
     _issue_search_cred = issue_search_cred
 
-    mcp.custom_route("/session/register", methods=["POST"])(http_session_register)
-    mcp.custom_route("/session/unregister", methods=["POST"])(http_session_unregister)
-    mcp.custom_route("/session/heartbeat", methods=["POST"])(http_session_heartbeat)
+    mcp.custom_route("/session/register", methods=["POST"])(
+        _origin_wrap(http_session_register, "register", 19998))
+    mcp.custom_route("/session/unregister", methods=["POST"])(
+        _origin_wrap(http_session_unregister, "unregister", 19998))
+    mcp.custom_route("/session/heartbeat", methods=["POST"])(
+        _origin_wrap(http_session_heartbeat, "heartbeat", 19998))
     mcp.custom_route("/session/active", methods=["GET"])(http_session_active)
-    mcp.custom_route("/session/event", methods=["POST"])(http_session_event)
+    mcp.custom_route("/session/event", methods=["POST"])(
+        _origin_wrap(http_session_event, "session_event", 19998))
     mcp.custom_route("/session/events", methods=["GET"])(http_session_events)
-    mcp.custom_route("/session/broadcast", methods=["POST"])(http_session_broadcast)
-    mcp.custom_route("/session/op-log", methods=["POST"])(http_session_op_log)
+    mcp.custom_route("/session/broadcast", methods=["POST"])(
+        _origin_wrap(http_session_broadcast, "broadcast", 19998))
+    mcp.custom_route("/session/op-log", methods=["POST"])(
+        _origin_wrap(http_session_op_log, "op_log", 19998))
     mcp.custom_route("/session/op-log", methods=["GET"])(http_session_op_log_query)
 
 
@@ -100,14 +111,28 @@ async def http_session_register(request: Request) -> JSONResponse:
         except Exception as _ie:
             logger.debug(f"[exp_injector] init 注入失败（不阻塞 register）: {_ie}")
         # Task639 新③: 未注入时守卫（:29 注释声称 None 时跳过签发，原直调 TypeError→500）
-        if _issue_search_cred is not None:
+        # 2611230886：机器名单内的名字不签发检索凭据（防两步绕过「不记套用」）
+        _machine_hit = False
+        _machine_import_failed = False
+        try:
+            from nexusos_mem.apply_honesty import MACHINE_AGENTS as _MA
+            _machine_hit = agent.strip().lower() in {n.strip().lower() for n in _MA}
+        except Exception as _e:
+            _machine_hit = False
+            _machine_import_failed = True
+            # 主控审阅补（2611230886）：导入失败不静默放行——记警告（身份+原因+照常签发）
+            logger.warning(f"[2611230886] 机器名单导入失败，身份 {agent} 无法判定，照常签发 search_cred（原因: {type(_e).__name__}: {_e}）")
+        if _machine_hit:
+            _search_cred = None
+            logger.info(f"[2611230886] 机器名单内身份 {agent} 登记不签发 search_cred（防绕过不记套用）")
+        elif _issue_search_cred is not None:
             _search_cred = _issue_search_cred(agent, body.get("role", "executor"))
         else:
             _search_cred = None
             logger.warning("[presence] _issue_search_cred 未注入，register 跳过 search_cred 签发")
-        return sessions, init_context, _search_cred
+        return sessions, init_context, _search_cred, _machine_hit
     try:
-        sessions, init_context, _search_cred = await anyio.to_thread.run_sync(_register_sync)
+        sessions, init_context, _search_cred, _machine_hit = await anyio.to_thread.run_sync(_register_sync)
     except ValueError as e:
         # Task524 P1-1a: 未注册 agent 等身份校验失败——客户端错返 400（原裸 500）
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -118,6 +143,7 @@ async def http_session_register(request: Request) -> JSONResponse:
         "ok": True, "agent": agent, "active": list(sessions.keys()),
         "init_context": init_context,
         **({"search_credential_id": _search_cred} if _search_cred else {}),
+        **({"search_credential_refused": "machine_identity"} if _machine_hit else {}),
     })
 
 
@@ -162,6 +188,11 @@ async def http_session_heartbeat(request: Request) -> JSONResponse:
     """Agent 心跳更新（每 60s 调用）。
 
     Body: {"agent":"zcode","status":"working","current_task":"...","context_pct":45}
+
+    2611192130 J1: 心跳同步落流 heartbeat 事件。聚合策略（防刷屏，60s 心跳
+    全发=每 agent 日 1440 条不可接受）：**状态或 current_task 变化 → 立即发**
+    （对账器靠它判会话活性段）；**无变化 → 300s 保底跳一条**（活性心跳证据，
+    每 agent 日 ≤288 条）。内存 last-state 缓存，进程重启后首条必发（保守）。
     """
     try:
         body = await request.json()
@@ -176,6 +207,9 @@ async def http_session_heartbeat(request: Request) -> JSONResponse:
             status=body.get("status", "working"),
             current_task=body.get("current_task", ""),
             context_pct=body.get("context_pct"),
+            # 2611230963 乙：心跳透传角色与会话号（重建记录时按名单定角色用）
+            session_id=body.get("session_id", ""),
+            role=body.get("role", ""),
         )
         return sessions, session_state.now_iso()
     try:
@@ -186,6 +220,24 @@ async def http_session_heartbeat(request: Request) -> JSONResponse:
     except Exception as e:
         logger.exception("HTTP /session/heartbeat 异常")
         return JSONResponse({"error": str(e)}, status_code=500)
+    # === 2611192130 J1: heartbeat 落流（聚合策略见 docstring）===
+    try:
+        import time as _t_hb
+        # 状态键剥离易变尾巴（" round=N" 等）——waitmon 每 15s 轮询的 round 计数
+        # 会击穿「状态变化才发」，剥离后同目标等待只按 300s 保底跳。
+        _task_norm = str(body.get("current_task", "")).split(" round=")[0][:60]
+        _cur = (str(body.get("status", "working")), _task_norm)
+        _prev, _last_ts = _HB_LAST_EVENT.get(agent, (None, 0.0))
+        _now = _t_hb.monotonic()
+        if _cur != _prev or (_now - _last_ts) >= _HB_MIN_INTERVAL_SEC:
+            if session_state.emit_system_event(
+                agent, "heartbeat",
+                detail=f"status={_cur[0]} task={_task_norm or '-'}"
+                       + ("" if _cur == _prev else "（状态变化即时发）"),
+            ):
+                _HB_LAST_EVENT[agent] = (_cur, _now)
+    except Exception:
+        pass  # 事件失败不影响心跳主流程
     return JSONResponse({"ok": True, "agent": agent, "heartbeat_at": hb_at})
 
 

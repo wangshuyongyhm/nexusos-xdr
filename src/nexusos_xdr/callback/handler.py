@@ -27,7 +27,9 @@ from starlette.responses import JSONResponse
 
 from nexusos_xdr import dispatchd
 from nexusos_common import subpath  # 1960：锚点单源（design §2.1 行10）
+from pathlib import Path  # Task 2611230853 件四：自动补齐要列任务目录里的 .md
 from nexusos_xdr import spill  # Task311 S1: callback 大 summary 外溢
+from nexusos_xdr.task_aliases import task_id_aliases
 from nexusos_xdr import task_state
 from nexusos_xdr._vault_env import VAULT_ROOT  # Task668: 包内自足（干净环境可解析）
 
@@ -40,6 +42,30 @@ logger = logging.getLogger("nexusos-xdr.mcp")  # 陷阱2: 保持原 logger 名�
 from nexusos_gate.gate_engine import check as gate_engine_check  # Task668 ②: 正源在 nexusos-gate 包
 
 
+async def http_callback_cred_stats(request: Request) -> JSONResponse:
+    """GET /callback_cred_stats — 回调凭据闸门的只读状态（2611231133）。
+
+    返回：当前模式（record/enforce）+ 最近 24 小时按来源（回调的 source 字段）的
+    「已核 / 缺 / 错」三类计数。只读：不改开关、不写任何东西。
+    可选 ?hours=N（1–168）调整窗口，默认 24。
+    """
+    try:
+        from nexusos_xdr.callback import cred_gate as _cg
+        hours = 24
+        try:
+            _qp = getattr(request, "query_params", None)
+            _raw = _qp.get("hours") if _qp is not None else None
+            if _raw:
+                hours = max(1, min(int(_raw), 168))
+        except Exception:  # noqa: BLE001 — 参数坏了按默认窗口
+            hours = 24
+        return JSONResponse(_cg.stats(hours=hours))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[2611231133] 状态接口异常: {type(e).__name__}: {e}")
+        return JSONResponse({"ok": False, "error": f"状态接口异常: {type(e).__name__}"},
+                            status_code=500)
+
+
 def register_routes(mcp) -> None:
     """在 mcp 实例上显式注册 callback 域路由（/callback POST）。
 
@@ -47,6 +73,73 @@ def register_routes(mcp) -> None:
     双注册），调用方保证单次。并发语义：仅注册期执行。
     """
     mcp.custom_route("/callback", methods=["POST"])(http_callback)
+    # 2611231133：回调凭据闸门的只读状态接口（模式 + 最近 24h 按来源的三类计数）
+    mcp.custom_route("/callback_cred_stats", methods=["GET"])(http_callback_cred_stats)
+
+
+
+def _autofix_registration(task_id: str, task_path: str, files: list, status: str) -> list:
+    """Task 2611230853 件四：完成门禁前自动补齐登记类内容（产出登记段 / 报告机读块）。
+
+    返回「补了什么」的说明列表，调用方逐条写进 task warnings（auto-fixed: …）。
+    任何一步失败只返回说明、不抛——自动补齐不能影响门禁与回调。
+    """
+    notes = []
+    try:
+        base = Path(task_path)
+        if base.name == "input":
+            base = base.parent
+        if not base.is_dir():
+            return notes
+        # ① 产出登记：任务目录下全部 .md（排除 dispatched 副本）都要以笔记链接形式列出
+        task_md = base / "input" / "task.md"
+        if task_md.is_file():
+            mds = [p for p in sorted(base.rglob("*.md"))
+                   if not p.name.startswith("task.dispatched.")]
+            text = task_md.read_text(encoding="utf-8", errors="replace")
+            missing = []
+            for p in mds:
+                rel = p.relative_to(base).as_posix()
+                link = f"[[task/{base.name}/{rel}]]"
+                if link in text or rel in text:
+                    continue
+                missing.append(link)
+            if missing:
+                lines = text.splitlines()
+                head = None
+                for i, ln in enumerate(lines):
+                    if ln.lstrip().startswith("#") and "产出登记" in ln:
+                        head = i
+                        break
+                if head is None:
+                    text = text.rstrip("\n") + "\n\n## 产出登记\n\n" + "\n".join(f"- {m}" for m in missing) + "\n"
+                else:
+                    end = len(lines)
+                    for j in range(head + 1, len(lines)):
+                        if lines[j].startswith("#"):
+                            end = j
+                            break
+                    block = [f"- {m}" for m in missing]
+                    while end > head + 1 and not lines[end - 1].strip():
+                        end -= 1
+                    lines[end:end] = block
+                    text = "\n".join(lines) + "\n"
+                task_md.write_text(text, encoding="utf-8")
+                notes.append(f"产出登记补 {len(missing)} 条（{'、'.join(m.split('/')[-1].rstrip(']') for m in missing[:3])}…）")
+        # ② 机读块：report.md 末尾没有 yaml 围栏就补一个最小块
+        report = base / "output" / "report.md"
+        if report.is_file():
+            body = report.read_text(encoding="utf-8", errors="replace")
+            if "```yaml" not in body[-800:]:
+                ev = [f for f in (files or []) if str(f).strip()]
+                block = ["", "```yaml", f"status: {status or 'complete'}", "evidence:"]
+                block += [f"  - {f}" for f in ev] or ["  - （回调未带 files）"]
+                block += ["next_steps:", '  - "（自动生成，待执行者补充）"', "```", ""]
+                report.write_text(body.rstrip("\n") + "\n" + "\n".join(block), encoding="utf-8")
+                notes.append("机读块补 1 个（status/evidence/next_steps）")
+    except Exception as e:  # noqa: BLE001 — 自动补齐失败只记说明，不阻断
+        notes.append(f"自动补齐异常（忽略）: {type(e).__name__}: {e}")
+    return notes
 
 
 def _build_gate_context(task_id: str, task_path: str, files: list,
@@ -121,10 +214,33 @@ async def http_callback(request: Request) -> JSONResponse:
     if len(source) > 50 or len(session) > 50:
         return JSONResponse({"error": "source/session 过长"}, status_code=400)
 
+    # 2611239006：服务端自己查来历（只记录）；并进回调留痕（body 会存进 callbacks）
+    try:
+        from nexusos_xdr import proc_origin as _po9006
+        _origin9006 = _po9006.observe("callback", str(body.get("source") or ""),
+                                     request=request, server_port=19998)
+        body["origin"] = _po9006.trace_block(_origin9006)
+    except Exception:  # noqa: BLE001 — 埋点绝不影响业务返回
+        _origin9006 = {}
     # 大小写兼容
     status = str(body.get("status", "")).lower()
     summary = body.get("summary", "")
     files = body.get("files", [])
+
+    # === 2611192130 J1: callback_arrived —— 回调到达本身落流（MEM#118115 空白②：
+    # 此前只有 done/progress 等业务态有事件，「回调到达」无独立痕迹——占位 done
+    # 与迟到 callback 无法分辨。校验通过即发（404 前置校验之后），status 原样入流。
+    # fire-and-forget：事件失败不影响回调主链（回调可用性 > 观测完整性）。
+    try:
+        from nexusos_xdr import session_state as _ss_j1
+        _ss_j1.emit_system_event(
+            source or "xdr", "callback_arrived",
+            detail=f"{task_id} callback status={status or '?'} session={session or '?'}",
+            target=f"task:{task_id}",
+            extra={"callback_status": status, "session": session},
+        )
+    except Exception:
+        pass
 
     # === Task311 S1: callback 大 summary 自动外溢（spill-to-disk）===
     # 单点截获（309 §2.1）：done result(:1119)/FAILED error(:1378)/callbacks[]
@@ -138,6 +254,74 @@ async def http_callback(request: Request) -> JSONResponse:
     state = await anyio.to_thread.run_sync(lambda: task_state.load_state(task_id))
     if state is None:
         return JSONResponse({"error": f"任务不存在: {task_id}"}, status_code=404)
+
+    # === 2611231133：完成回调必须出示派单凭据（第一层：系统验）===
+    # 背景：原来只查「任务自己名下的派单凭据在库里还有效」，不要求调用方拿出来
+    # （Task532 P-d4 的妥协：知道 task_id 就能伪造 done）。本段要求调用方出示，
+    # 并且必须等于该任务台账里的 credential_id。规则见 references §2.1：
+    #   出示且正确 → 照常；出示了但不对 → 两种模式下都拒；
+    #   没出示（或台账无凭据可比对）→ 按开关走（record 只记录 / enforce 拒）。
+    # 热路径纪律：只读一个小 JSON 文件（每次请求读，改文件即生效、不用重启）+ 追加一行计数，
+    # 不在这里连库（现有的凭据有效性校验仍在下面 done 分支里照旧）。
+    # === 2611239908：拿不到派单凭据的执行者怎么报不规范派单 ===
+    # 死结：约束文档让这种执行者用「需要决策」上报，可统一回调命令没有凭据就拒绝执行、
+    # 强制模式下的裸回调也会被拒——真遇到不规范派单反而报不上来。这条通道**只记录**：
+    # 状态必须是 need_decision 且带明确标记字段（cred_gate.MISSING_CRED_REPORT_FIELD），
+    # 两种模式都接受、只在状态接口单列计数，不改任务状态、不触发自动判定。
+    # 标记判定本身失败 → 当普通回调处理（按凭据规则走），不往「放过」一侧倒。
+    try:
+        from nexusos_xdr.callback import cred_gate as _cg_rep1133
+        _miss_report1133 = _cg_rep1133.is_missing_cred_report(body, status)
+    except Exception as _rep_e1133:  # noqa: BLE001 — 判定不了按普通回调处理（拒绝侧）
+        logger.warning(f"[2611239908] 报告通道判定失败（按普通回调处理）: "
+                       f"{type(_rep_e1133).__name__}")
+        _miss_report1133 = False
+
+    try:
+        from nexusos_xdr.callback import cred_gate as _cg1133
+        _presented1133 = (str(request.headers.get("X-Callback-Credential") or "")
+                          or str(body.get("callback_credential") or "")).strip()
+        _mode1133, _mode_err1133 = _cg1133.read_mode()
+        if _miss_report1133:
+            # 2611239908：只记录——不比对凭据、不拒、不碰状态机（走下面的 need_decision 分支）
+            _cg1133.record_missing_cred_report(task_id, source, status,
+                                               detail=f"mode={_mode1133}")
+            logger.info(f"[2611239908] {task_id} 无凭据报不规范派单已留痕（mode={_mode1133}）")
+        else:
+            _ledger_cred1133 = str((state or {}).get("credential_id") or "").strip()
+            _outcome1133 = _cg1133.decide(_presented1133, _ledger_cred1133, _mode1133)
+            _cg1133.record(_outcome1133, task_id, source, status,
+                           detail=(f"mode={_mode1133}" + (f"；{_mode_err1133}" if _mode_err1133 else "")))
+            if _cg1133.should_reject(_outcome1133, _mode1133):
+                _why1133 = ("出示的派单凭据与该任务台账不一致（零写入）"
+                            if _outcome1133 == "wrong"
+                            else f"完成回调必须出示派单凭据（当前模式 {_mode1133}）")
+                logger.warning(f"[2611231133] {task_id} 回调凭据被拒 outcome={_outcome1133} mode={_mode1133}")
+                return JSONResponse({
+                    "ok": False, "rejected": True, "reason": _why1133,
+                    "credential_outcome": _outcome1133, "mode": _mode1133,
+                    "msg": ("请求头带 X-Callback-Credential: <任务书副本 frontmatter 的 credential_id>；"
+                            "或用统一回调命令 bash nexus-callback.sh <任务号> <任务书副本> <status> \"<摘要>\""),
+                }, status_code=403)
+    except Exception as _cg_e1133:  # noqa: BLE001
+        # 2611239905：异常时的默认值要落在「不放过」的一侧——重新读一次开关（读不到按 record），
+        # 开关是 enforce 就拒绝。原来这里一律「按 record 继续」，等于给强制模式留了个 fail-open 口。
+        _mode_fb1133 = "record"
+        try:
+            from nexusos_xdr.callback import cred_gate as _cg_fb
+            _mode_fb1133, _ = _cg_fb.read_mode()
+        except Exception as _fb_e:  # noqa: BLE001 — 连开关都读不到：只能按 record（运维路径）
+            logger.warning(f"[2611239905] 闸门异常后读开关也失败，按 record: "
+                           f"{type(_fb_e).__name__}")
+        logger.warning(f"[2611231133] 回调凭据闸门异常（mode={_mode_fb1133}）: "
+                       f"{type(_cg_e1133).__name__}: {_cg_e1133}")
+        # 2611239908：报告通道是正当的求助流量，闸门自身异常也不该把它拒掉（只记录）
+        if _mode_fb1133 == "enforce" and not _miss_report1133:
+            return JSONResponse({
+                "ok": False, "rejected": True,
+                "reason": f"凭据闸门异常（强制模式拒绝）: {type(_cg_e1133).__name__}",
+                "mode": _mode_fb1133,
+            }, status_code=403)
 
     if status in ("done", "completed", "success"):
         # === Task393 P1: 凭据校验 fail-closed（无凭据新task→真403）===
@@ -257,8 +441,47 @@ async def http_callback(request: Request) -> JSONResponse:
                 _gate_ctx_bg = _build_gate_context(
                     _task_id, _state.get("task_path", ""), _files, _summary, _body)
                 _report_full = _gate_ctx_bg["task_path_report"]
+                # Task 2611230853 件四：登记类硬拦（G12 机读块 / G14 产出登记）先自动补齐再判
+                for _note in _autofix_registration(
+                        _task_id, _state.get("task_path", ""), _files, _body.get("status", "")):
+                    try:
+                        task_state.append_warning(_task_id, f"auto-fixed: {_note}")
+                    except Exception:
+                        pass
+                # 硬拦为什么用 end_reason 不用新状态：task_state.TERMINAL_STATES 被哨兵脚本
+                # should_fire.py 硬编码，新增状态=全线炸；被拦任务 status 保持 DONE，
+                # 用 end_reason=gate_blocked + /task_state 的 blocked_* + 48h 日汇总显形。
                 _ge = gate_engine_check("done", _gate_ctx_bg,
                                         agent=(_state.get("callee") or _body.get("source", "")))
+                # 池 #969-B（2611192126）：YAML 层豁免可见性——豁免≠放水，
+                # task_state.gate_exempt + 事件流 gate_exempt（日报统计当日
+                # 豁免数防滥用无人知）。fail-open：标记失败不阻断 done 链。
+                _exem = _ge.get("exempted") or []
+                if _exem:
+                    _exm_rules = sorted({str(e.get("rule")) for e in _exem})
+                    _exm_items = ",".join(str(e.get("item")) for e in _exem)
+                    logger.info("[pool#969-B] %s done gate 豁免(%s): %s",
+                                _task_id, _exm_rules, _exm_items)
+                    try:
+                        task_state.update_field(_task_id, "gate_exempt", _exm_rules)
+                    except Exception:
+                        pass
+                    try:
+                        task_state.append_warning(
+                            _task_id,
+                            f"gate_exempt={'/'.join(_exm_rules)}: "
+                            f"跳过 {_exm_items}（影子任务豁免，日报可见）")
+                    except Exception:
+                        pass
+                    try:
+                        from nexusos_xdr import session_state as _ss_969
+                        _ss_969.append_event(
+                            "xdr", "gate_exempt",
+                            detail=f"{_task_id} 豁免 {len(_exem)} 项"
+                                   f"（{'/'.join(_exm_rules)}）: {_exm_items}",
+                            target=f"task:{_task_id}")
+                    except Exception:
+                        pass
                 if not _ge.get("passed"):
                     _fails = [f"{r['id']}_{r.get('severity','WARN')}: {r.get('detail','')}"
                               for r in _ge.get("failures", []) if r.get("status") == "fail"]
@@ -343,9 +566,9 @@ async def http_callback(request: Request) -> JSONResponse:
                 # 覆盖→gate G10 永 fail」死循环（1269 验收实测两轮复现）
                 _cur_b1.execute(
                     "SELECT id, target_id FROM agent_activity "
-                    "WHERE action='apply_attempt' AND task_id=%s "
+                    "WHERE action='apply_attempt' AND task_id = ANY(%s) "
                     "AND outcome IS NULL",
-                    (task_id,),
+                    (task_id_aliases(task_id, ""),),
                 )
                 _rows_b1 = _cur_b1.fetchall()
             finally:
@@ -363,6 +586,10 @@ async def http_callback(request: Request) -> JSONResponse:
                             exp_id=_c["exp_id"],
                             result="pending",
                             evidence=f"auto by callback task_id={task_id}",
+                            by="system/callback-pending-fill",  # 2611230944 甲-6
+                            on_behalf=True,
+                            entry="system",
+                            system_flow="callback-pending-fill",  # 2611230960 乙：显式系统流程参数
                         )
                         _ok_s6 += 1
                     except Exception as _ae:
@@ -432,6 +659,37 @@ async def http_callback(request: Request) -> JSONResponse:
         # === Task 350: experiences 自动写入 MEM（链路③ 知识共享基础设施）===
         # 有 experiences 则写 MEM（让小弟发的经验真进库，其他 Agent 立即可见）；
         # 无则已在 result 标 experiences_missing=true（不阻断 done，主控可见）。
+        # 2611230868（认知诚实闭环根修第一段）：任务完成自动判定曝光。
+        # 位置：完成门禁之后（无论过没过都执行）；任何失败只警告不影响回调。
+        # 2611230875 修复：调用处只传 task_id 与执行者名——任务路径由函数内
+        # 从台账自取（原 _state 在本作用域未定义，每次 NameError 被吞=生产路径从未执行）
+        # 2611239003：派单方是主控的任务，自动判定延后到签收之后（开关 defer_judge）。
+        # record：照判，但记一条「若延后会推迟多少条」；enforce：真延后（不判）。
+        try:
+            from nexusos_xdr import ack_policy as _ap868
+            _pol868 = _ap868.read_policy()
+            _caller868 = str((state or {}).get("caller") or "") if state else ""
+            _defer868 = _ap868.should_defer_judge(_caller868, _pol868["defer_judge"])
+            if _defer868:
+                _n868 = _ap868.count_pending_for_task(task_id)
+                _ap868.record("judge_deferred", task_id, _caller868,
+                              "回调时延后自动判定（等签收）", extra={"would_defer": _n868})
+            else:
+                await anyio.to_thread.run_sync(
+                    lambda: auto_judge_task_exposures(
+                        task_id, body.get("source", ""), ""))
+                # 判过就打标：签收路径看到这个字段就不再判（一个任务只判一次）
+                try:
+                    task_state.update_field(task_id, "auto_judged_at", task_state.now_iso())
+                except Exception as _mk868:  # noqa: BLE001
+                    logger.warning(f"[2611239003] {task_id} 记 auto_judged_at 失败: {_mk868}")
+                if _pol868["defer_judge"] == "record" and _ap868.is_orchestrator(_caller868):
+                    _n868 = _ap868.count_pending_for_task(task_id)
+                    _ap868.record("judge_deferred_would", task_id, _caller868,
+                                  "record 模式：照判，若延后会推迟这些", extra={"would_defer": _n868})
+        except Exception as _e868:
+            logger.warning(f"[2611230868] 自动判定失败（不影响回调）: {_e868}")
+
         # 陷阱1：MEM 写入失败绝不阻断 callback（MEM 挂了不能影响 task 闭环）。
         # 陷阱2：tags 兼容逗号字符串和数组两种格式。knowledge_type 默认 experience。
         if experiences:
@@ -457,8 +715,12 @@ async def http_callback(request: Request) -> JSONResponse:
                     headers={"Content-Type": "application/json"},
                 )
                 try:
-                    # Task494: urlopen 包在 run_sync lambda 里（AST 可见 run_sync 上下文）
-                    _resp_raw = await anyio.to_thread.run_sync(lambda _r=_req: _urlreq.urlopen(_r, timeout=5).read())
+                    # Task494: urlopen 包在 run_sync 里（AST 可见 run_sync 上下文）
+                    # 2611192100 Q1a: 原写法 .read() 后不 close → FD 泄漏；改为 with 收尾
+                    def _fetch(_r=_req):
+                        with _urlreq.urlopen(_r, timeout=5) as _fp:
+                            return _fp.read()
+                    _resp_raw = await anyio.to_thread.run_sync(_fetch)
                     _resp = _json350.loads(_resp_raw) if _resp_raw else {}
                     if isinstance(_resp, dict) and _resp.get("ok", True) is not False:
                         _write_ok += 1
@@ -512,16 +774,16 @@ async def http_callback(request: Request) -> JSONResponse:
                     """
                     SELECT
                         (SELECT COUNT(*) FROM agent_activity
-                         WHERE action='apply_attempt' AND task_id=%s) AS cand,
+                         WHERE action='apply_attempt' AND task_id = ANY(%s)) AS cand,
                         (SELECT COUNT(*) FROM agent_activity ao
                          JOIN agent_activity aa
                            ON aa.id::text = ao.detail->>'apply_attempt_id'
                            AND aa.action = 'apply_attempt'
                          WHERE ao.action='apply_outcome'
-                           AND aa.task_id=%s
+                           AND aa.task_id = ANY(%s)
                            AND COALESCE(ao.detail->>'result','') != 'pending') AS annotated
                     """,
-                    (task_id, task_id),
+                    (task_id_aliases(task_id, ""), task_id_aliases(task_id, "")),
                 )
                 _cand_count, _annotated_count = _cur_warn.fetchone()
                 _cur_warn.close()
@@ -636,3 +898,144 @@ async def http_callback(request: Request) -> JSONResponse:
 
     else:
         return JSONResponse({"error": f"未知 status: {status}"}, status_code=400)
+
+
+def auto_judge_task_exposures(task_id: str, callee: str, task_path: str) -> dict:
+    """2611230868：完成回调自动判定（机械可复核）。
+
+    1. 找本任务名下未结案曝光：task_id 等于本任务的，加上按 bind_task 能归到本任务的。
+    2. 读任务产物（task.md/references.md/report.md/evidence.md 存在哪个读哪个），
+       算出被引用编号集合（cited_knowledge_ids）。
+    3. not_used → UPDATE 结案「未采用」；adopted → 不结案，detail 标「已采用、待给结果」。
+    任何失败只记日志不抛（不阻断回调）。
+    """
+    import psycopg2
+    from nexusos_mem.apply_honesty import cited_knowledge_ids, judge_exposures, bind_task
+    from nexusos_xdr.task_aliases import task_id_aliases
+
+    try:
+        conn = psycopg2.connect("host=127.0.0.1 port=5432 dbname=nexus_mem user=wang")
+        # 2611230875：任务路径从台账自取（调用处不传；原传 _state 是 NameError 源头）
+        if not task_path:
+            _st = task_state.load_state(task_id) or {}
+            task_path = _st.get("task_path", "") or ""
+        conn.autocommit = False
+        cur = conn.cursor()
+        # 本任务直标（task_id 列）
+        # 2611230889：只处理本任务执行者（或身份为空）的记录；别的身份带本任务号
+        # 留下的记录不动，计数进 foreign_untouched 并记日志交主控
+        cur.execute(
+            "SELECT id, agent_id, target_id, created FROM agent_activity "
+            "WHERE action='apply_attempt' AND (outcome IS NULL OR outcome='pending') "
+            "AND task_id = ANY(%s)",
+            (task_id_aliases(task_id, task_path),))
+        _all_direct = cur.fetchall()
+        foreign_untouched = [r[0] for r in _all_direct
+                             if callee and r[1] and r[1] != callee]
+        if foreign_untouched:
+            logger.warning(f"[2611230889] {task_id} 有 {len(foreign_untouched)} 条别的身份"
+                           f"留下的曝光未处理（交主控）: {foreign_untouched[:5]}")
+        cur.execute(
+            "SELECT id, agent_id, target_id, created FROM agent_activity "
+            "WHERE action='apply_attempt' AND (outcome IS NULL OR outcome='pending') "
+            "AND task_id = ANY(%s) AND (agent_id = %s OR agent_id IS NULL OR agent_id = '')",
+            (task_id_aliases(task_id, task_path), callee))
+        direct = [{"id": r[0], "agent_id": r[1], "target_id": r[2],
+                   "created": str(r[3])} for r in cur.fetchall()]
+        seen = {e["id"] for e in direct}
+        # bind_task 归入（callee 名下无 task_id 的；执行者时间窗=任务全程，近似起止用台账）
+        if callee:
+            cur.execute(
+                "SELECT id, agent_id, target_id, created FROM agent_activity "
+                "WHERE action='apply_attempt' AND (outcome IS NULL OR outcome='pending') "
+                "AND agent_id = %s AND (task_id IS NULL OR task_id = '')", (callee,))
+            # 2611230868 复核追加：bind_task 生产路径传「该执行者最近 10 条任务」
+            # （否则同窗多任务规则等于没生效——只传本任务永远单候选）
+            import glob as _g868, json as _j868, os as _os868
+            _cal_tasks = []
+            try:
+                _rows_t = []
+                for _f in _g868.glob(_os868.path.expanduser('~/.nexus/xdr/tasks/*.json')):
+                    try:
+                        _d = _j868.load(open(_f, encoding='utf-8'))
+                    except Exception:
+                        continue
+                    if _d.get('callee') == callee:
+                        _rows_t.append({"task_id": _d.get("task_id"), "callee": callee,
+                                        "started": _d.get("started"),
+                                        "finished": _d.get("finished"),
+                                        "created": _d.get("created")})
+                _rows_t.sort(key=lambda x: str(x.get("created") or ""), reverse=True)
+                _cal_tasks = _rows_t[:10]
+            except Exception:
+                _cal_tasks = []
+            # 2611230884 N-16：台账读不到时不造无时间的兜底项（bind_task 会永远归不上）
+            tasks = _cal_tasks
+            for r in cur.fetchall():
+                a = {"id": r[0], "agent_id": r[1], "target_id": r[2],
+                     "created": str(r[3])}
+                if a["id"] in seen:
+                    continue
+                if not tasks:
+                    logger.warning(f"[2611230884] {task_id} 台账无可用任务列表，曝光 {a['id']} 未归任务（不造无时间兜底）")
+                    continue
+                b = bind_task(a, tasks)
+                if b and b.get("task_id") == task_id:
+                    # 2611230884 N-9：归入任务时回填 task_id 列（签收接口只查这一列）
+                    try:
+                        cur.execute(
+                            "UPDATE agent_activity SET task_id = %s WHERE id = %s "
+                            "AND (task_id IS NULL OR task_id = '')", (task_id, a["id"]))
+                    except Exception:
+                        pass
+                    direct.append(a)
+                    seen.add(a["id"])
+        # 读任务产物
+        import os as _os868
+        texts = []
+        if task_path:
+            base = _os868.path.dirname(_os868.path.dirname(task_path))
+            # 2611230875 甲-1/1b：判据只读执行者写的东西（主控任务书与参考件里
+            # 有 exp_injector 注入的编号，会造假 adopted）
+            for rel in ("output/report.md", "output/files/evidence.md",
+                        "output/negative-results.md"):
+                p = _os868.path.join(base, rel)
+                if _os868.path.exists(p):
+                    try:
+                        texts.append(open(p, encoding="utf-8", errors="replace").read())
+                    except Exception:
+                        pass
+        cited = cited_knowledge_ids(texts)
+        verdicts = judge_exposures(direct, cited)
+        closed = adopted = 0
+        for v in verdicts:
+            if v["verdict"] == "not_used":
+                cur.execute(
+                    "UPDATE agent_activity SET outcome='not_applicable', "
+                    "detail = detail || jsonb_build_object('auto_judged','not_applicable',"
+                    "'judged_by','auto/2611230868','basis','任务产物未引用该经验') "
+                    "WHERE id = %s AND (outcome IS NULL OR outcome='pending')",
+                    (v["attempt_id"],))
+                closed += cur.rowcount
+            else:
+                # 2611230884 N-3：引用语境含否定词（「不要用/勿用/别用」）→ 留痕提示人工复核
+                _neg = any(re.search(r"(?:不要用|勿用|别用|弃用)\s*(?:MEM#?\\d+|经验\\s*\\d+|编号\\s*\\d+)", t)
+                           for t in texts)
+                cur.execute(
+                    "UPDATE agent_activity SET "
+                    "detail = detail || jsonb_build_object('auto_judged','adopted',"
+                    "'judged_by','auto/2611230868','basis','任务产物引用该经验',"
+                    "'neg_context_hint'," + ("true" if _neg else "false") + ") "
+                    "WHERE id = %s AND (outcome IS NULL OR outcome='pending')",
+                    (v["attempt_id"],))
+                adopted += cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"task_id": task_id, "exposures": len(direct),
+                "closed_not_used": closed, "adopted_pending_result": adopted,
+                "foreign_untouched": len(foreign_untouched),
+                "cited_ids": sorted(cited)[:20]}
+    except Exception as e:
+        logger.warning(f"[2611230868] 自动判定异常: {type(e).__name__}: {e}")
+        return {"task_id": task_id, "error": f"{type(e).__name__}: {e}"}

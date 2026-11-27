@@ -17,9 +17,12 @@ import os
 import re
 import time
 import fcntl
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("task_state")
 
 # 复用 nexus_mem_utils（在 自动化脚本/ 目录）
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -111,6 +114,11 @@ def task_path(task_id: str) -> Path:
 
 def ensure_dir() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # 2611230963 戊：台账目录收紧到 0700（内含派单凭据；幂等 chmod，不动内容）
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError as _ce:
+        logger.warning("[task_state] 台账目录收紧权限失败（不阻断）: %s", _ce)
 
 
 # task 275 P0-2: 跨进程/跨线程排他锁，解决 update_status/append_callback/
@@ -186,7 +194,13 @@ def save_state(state: Dict[str, Any]) -> None:
     tid = state.get("task_id")
     if not tid:
         raise ValueError("state 缺少 task_id")
-    atomic_write_json(task_path(tid), state)
+    p = task_path(tid)
+    atomic_write_json(p, state)
+    # 2611230963 戊：台账文件收紧到 0600（内含派单凭据号；幂等 chmod，不动内容）
+    try:
+        os.chmod(p, 0o600)
+    except OSError as _ce:
+        logger.warning("[task_state] 台账文件收紧权限失败（不阻断）: %s", _ce)
 
 
 def load_state(task_id: str) -> Optional[Dict[str, Any]]:
@@ -195,6 +209,20 @@ def load_state(task_id: str) -> Optional[Dict[str, Any]]:
 
 
 def record_poll(task_id: str) -> None:
+    # Task 2611230853 件三：patrol 每轮都会走到这里 → 顺路做被拦欠账的日汇总（轻量、内部节流）
+    try:
+        from nexusos_xdr.p02_hardblock import gate_debt_tick
+        gate_debt_tick()
+    except Exception:
+        pass  # silent: 欠账告警是观测件，失败不影响轮询记录
+    # Task 2611230867 件三：同一位置顺路触发停摆看门狗（2611230959 甲修正：
+    # 看门狗里有 25 秒复核与子进程，只能在后台线程跑——这里只异步触发（单飞由
+    # tick 内部的非阻塞锁保证）；触发失败记警告，不再静默吞掉）
+    try:
+        from nexusos_xdr.stall_watch import trigger_async as _stall_trigger
+        _stall_trigger()
+    except Exception as _se:
+        logger.warning("[stall-watch] 异步触发失败（不阻断轮询记录）: %s", _se)
     """Task514: 记录主控轮询感知（poll_count + last_polled_at 持久化到单一真源）。
 
     GET /task/{id} 与 MCP check_task_status 查询成功时调本函数。
@@ -482,9 +510,21 @@ def append_callback(
                 f"callbacks 已达上限 {max_callbacks}（锁内复核，T1556 B3）"
             )
         state.setdefault("callbacks", []).append(
-            {"ts": now_iso(), **callback}
+            # 2611230963 戊：回调正文落台账前打码凭据号（形状以 credential 签发函数为准）；
+            # 派单凭据 credential_id 字段是回调校验要读的，不打
+            {"ts": now_iso(), **_mask_callback_credentials(callback)}
         )
         save_state(state)
+
+
+def _mask_callback_credentials(callback: Dict[str, Any]) -> Dict[str, Any]:
+    """回调体里凭据号打码；credential_id 字段保持完整（回调校验要读）。"""
+    from nexusos_xdr.credential import _mask_obj
+    keep = callback.get("credential_id")
+    masked = _mask_obj(callback)
+    if keep is not None and "credential_id" in callback:
+        masked["credential_id"] = callback["credential_id"]
+    return masked
 
 
 def append_warning(task_id: str, warning: str) -> None:

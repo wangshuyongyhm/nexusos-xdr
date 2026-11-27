@@ -56,7 +56,11 @@ def _epoch(iso_ts: Any) -> float:
     if not iso_ts:
         return 0.0
     try:
-        return datetime.datetime.fromisoformat(str(iso_ts)).timestamp()
+        # 2611192100 Q1f: naive 时间戳按 UTC 归一，避免本地时区偏移（原写法直接 .timestamp()）
+        _dt = datetime.datetime.fromisoformat(str(iso_ts))
+        if _dt.tzinfo is None:
+            _dt = _dt.replace(tzinfo=datetime.timezone.utc)
+        return _dt.timestamp()
     except ValueError:
         return 0.0
 
@@ -113,8 +117,15 @@ def handle_ack(task_id: str, key: str, agent: str,
 
     already = ack.get("state") == "acked"
     if not already:
-        ack.update({"state": "acked", "at": task_state.now_iso(), "agent": agent})
+        _receipt_at = task_state.now_iso()
+        ack.update({"state": "acked", "at": _receipt_at, "agent": agent})
         task_state.update_field(task_id, "ack", ack)
+        # 2611239907：投递回执时刻写进它自己的字段——签收写 signoff 字段（routes
+        # http_task_ack），两者互不覆盖（原共用 ack 字段，签收把回执时刻抹掉，
+        # 339 单里 320 单回执时刻没了）。重复回执保持首次时刻（幂等语义同 steer）。
+        task_state.update_field(task_id, "delivery_receipt",
+                                {"key": key or ack.get("key"), "kind": kind,
+                                 "at": _receipt_at, "agent": agent})
     # 落账（重复回执也记——重复投递审计面）；落账失败不吞回执（warning 可观测）
     try:
         from nexusos_xdr.session_state import append_event
@@ -127,6 +138,49 @@ def handle_ack(task_id: str, key: str, agent: str,
             "duplicate": already, "agent": agent, "kind": kind}
 
 
+def delivery_receipt_at(state: Dict[str, Any]) -> Optional[str]:
+    """投递回执时刻（2611239907）：新字段 delivery_receipt.at 优先；
+    读不到回看老字段 ack.at（老任务——回执与签收曾共用 ack 字段，签收会覆盖它，
+    只有「回执形」（带 key/kind）的 ack 才算，签收形（key_points/ack_identity）不算）。"""
+    dr = state.get("delivery_receipt") or {}
+    if isinstance(dr, dict) and dr.get("at"):
+        return str(dr["at"])
+    ack = state.get("ack") or {}
+    if isinstance(ack, dict) and ack.get("at") and (ack.get("key") or ack.get("kind")):
+        return str(ack["at"])
+    return None
+
+
+def _output_has_fresh_files(state: Dict[str, Any], now: float,
+                            window_sec: float) -> bool:
+    """任务目录 output/ 在窗口内有新文件（进度物证②，2611239907）。
+
+    读取出错一律按「无物证」（=保持原行为走重投/判失败，不悄悄放过）并记警告。
+    """
+    task_path = str(state.get("task_path") or "")
+    if not task_path:
+        return False
+    try:
+        # task_path=<root>/input/task.md → root/output
+        root = Path(task_path).parent.parent
+        out_dir = root / "output"
+        if not out_dir.is_dir():
+            return False
+        cutoff = now - window_sec
+        for p in out_dir.rglob("*"):
+            try:
+                if p.is_file() and p.stat().st_mtime >= cutoff:
+                    return True
+            except OSError:
+                continue
+        return False
+    except Exception as e:  # noqa: BLE001
+        import logging
+        logging.getLogger("ack").warning(
+            "[ack] 产出物证读取异常（按无物证处理）: %s: %s", type(e).__name__, e)
+        return False
+
+
 def ack_timeout_action(state: Dict[str, Any],
                        now: Optional[float] = None) -> Tuple[str, str]:
     """超时判定（纯函数，patrol 每轮调 + 测试直测）。
@@ -134,7 +188,7 @@ def ack_timeout_action(state: Dict[str, Any],
     返回 (action, reason)：
       skip  —— 非 pending（无登记/已 ack/已 late）
       wait  —— 未到 deadline
-      late  —— 超窗但有进度物证（callbacks 非空）——执行已开始，不重投
+      late  —— 超窗但有进度物证（callbacks 非空，或产出目录窗口内有新文件）——执行已开始，不重投
       retry —— 超窗无物证且 attempts<2 —— 重投（同键，patrol 侧执行）
       fail  —— 超窗无物证且 attempts>=2 —— 投递失败终态
     """
@@ -147,6 +201,10 @@ def ack_timeout_action(state: Dict[str, Any],
         return "wait", f"deadline 差 {deadline - now:.0f}s"
     if state.get("callbacks"):
         return "late", "超 ACK 窗但有回调物证——执行已开始，不重投"
+    # 2611239907：进度物证②——产出目录在窗口内有新文件（先读任务后发回执的执行者
+    # 会在窗口内留下产出；别过头：只有回调与产出新文件两种，面板迹象不算）
+    if _output_has_fresh_files(state, now, ACK_WINDOW_SEC):
+        return "late", "超 ACK 窗但产出目录窗口内有新文件——执行已开始，不重投"
     attempts = int(ack.get("attempts") or 1)
     if attempts >= 2:
         return "fail", f"重投后仍无回执无物证（attempts={attempts}）"

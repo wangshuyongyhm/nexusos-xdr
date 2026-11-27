@@ -17,7 +17,7 @@ Task631/633 迁包: 正源自 vault 内 nexusos_xdr/ 迁入 pip 包（旧位 __i
 __path__ 重定向到本包——旧位 shim/配置文件作为子模块回退源继续可用）。
 """
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 # ── 路径自愈（批3 过渡层，批2 nexusos_mem 同款）────────────────────
 # 迁移件仍引用 vault 级平铺件与 mem 域包（nexus.paths_setup 副作用、

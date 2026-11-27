@@ -16,6 +16,32 @@ import json
 import logging
 import os
 import secrets as _secrets
+import re
+
+# 2611230963 戊：凭据号形状（以 issue_credential 的签发格式为准：cred_ + 16 位小写 hex）
+CRED_ID_RE = re.compile(r"cred_[0-9a-f]{16}")
+
+
+def mask_credential_ref(text: str) -> str:
+    """把文本里的凭据号打码成引用（前 8 位 + 省略号），非凭据内容不动。
+
+    用途：台账/回调正文等「留存但不使用」的面——不再落明文全号。
+    派单凭据 credential_id 是回调校验要读的，不走这里。
+    """
+    return CRED_ID_RE.sub(lambda m: m.group(0)[:8] + "…", str(text))
+
+
+def _mask_obj(obj):
+    """递归打码 dict/list/str 结构里的凭据号（append_callback 用）。"""
+    if isinstance(obj, str):
+        return mask_credential_ref(obj)
+    if isinstance(obj, dict):
+        return {k: _mask_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_mask_obj(v) for v in obj]
+    return obj
+
+
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -84,6 +110,22 @@ def issue_credential(
     Returns:
         credential_id（UUID）或 None（签发失败）
     """
+    # 2611230901：检索凭据的签发收口——机器名单内的名字不签发（登记与派单
+    # 两条路径都走这里；判断下沉到本函数=唯一咽喉点）。导入失败照常签发但留痕。
+    if cred_type == "search_cred":
+        _bearer_norm = bearer.strip().lower()
+        try:
+            from nexusos_mem.apply_honesty import MACHINE_AGENTS as _MA_901
+            if _bearer_norm in {n.strip().lower() for n in _MA_901}:
+                logger.warning(f"[2611230901] 机器名单内身份 {bearer} 不签发 search_cred（防绕过不记套用）")
+                return None
+        except Exception as _e:
+            # 2611239006（红队五轮 G2）：名单查不了就不发——原来「照常签发并留痕」是出错放行，
+            # 机器身份能借此拿到检索凭据（绕过「不记套用」）。默认值翻到拒绝一侧。
+            logger.warning(f"[2611230901] 机器名单导入失败，身份 {bearer} 无法判定，**拒绝签发**"
+                           f"（2611239006 翻到拒绝侧；原因: {type(_e).__name__}: {_e}）")
+            return None
+
     try:
         conn = _get_conn()
         cur = conn.cursor()
