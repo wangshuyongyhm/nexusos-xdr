@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nexusos-xdr"
 version = "1.2.0"
-description = "NEXUS-XDR — Agent 调度总线（dispatch/callback/presence/patrol + MCP :19998）"
+description = "nexusos-xdr — NEXUS agent dispatch bus (dispatch / callback / presence / patrol, with an MCP endpoint)"
 readme = "README.md"
 requires-python = ">=3.10"
 # PEP 621 旧式 text 表（非 SPDX 表达式）——保留 License classifier 不被新版
@@ -13,7 +13,17 @@ requires-python = ">=3.10"
 # 干净 venv 安装失败（1609 实测 InvalidConfigError）。
 license = {text = "MIT"}
 authors = [{name = "NEXUS Contributors"}]
-classifiers = ["License :: OSI Approved :: MIT License"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: MacOS",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 # 逐文件实测顶层 import（任务书⚠️批1 pyyaml 教训）：
 # fastmcp(mcp_server) + anyio/starlette(mcp_server/callback/httpapi/presence 直用同栈)
 # + psycopg2(credential/layer2_calibrate/callback顶层, mcp_server懒) + pyyaml(agents/base 懒)。
